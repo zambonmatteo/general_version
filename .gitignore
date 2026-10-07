@@ -1,0 +1,5 @@
+/bin_input/
+/generated/
+/bin_host/
+/bin_board/
+__pycache__/
