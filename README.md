@@ -210,20 +210,37 @@ run; `make prepare` generates deployment data only.
 
 ## Model description and C interface
 
-`model.json` describes the network and input encoding; `model.bin` contains LUT
-tables, routing indices and thresholds. Preparation validates both and generates
-`model_specs.h`. The firmware uses these C descriptors and embedded binary data.
+`model.json` describes the layers, their execution order and input encoding.
+`model.bin` stores LUT tables, routing indices and encoding thresholds.
+Preparation checks both files and creates `generated/model_specs.h`: a C header
+describing tensor shapes, operations and where layer data is stored in the
+binary file. It is generated automatically; update the model files and rebuild
+to change the network.
 
-Explicit models use `format_version: 1`, `total_bytes`, `layers`, `encoding`
-and `operations`. Supported operations are `lut_conv`, `or_pool`, `flatten`,
-`lut_fc` and `groupsum`. Layer shapes must connect consistently, with GroupSum
-last. Supported legacy JSONs without `operations` are adapted automatically.
+For models that explicitly list their operations, `model.json` must contain
+these four fields:
 
-The C API is declared in `src/model.h`. Encoded inputs use CHW bitplanes, packed
-LSB first and byte-padded per plane.
+- `total_bytes`: the expected size of `model.bin`, in bytes.
+- `layers`: descriptions of the LUT layers and the locations of their binary data.
+- `encoding`: settings for binarizing the raw inputs.
+- `operations`: the sequence of operations to execute during inference.
 
-Call `model_init()` once to validate and initialize the model, then
-`model_forward()` for each already binarized sample to obtain its predicted
-class. Provide a workspace of `model_workspace_bytes()` bytes and check the
-returned `ModelStatus`. Buffers must not overlap; model descriptors and binary
-data must remain valid and unchanged. The engine uses no dynamic allocation.
+Supported operations are convolution (`lut_conv`),
+OR pooling (`or_pool`), flattening (`flatten`), fully connected layers (`lut_fc`)
+and class selection (`groupsum`). Each operation's output shape must match the
+next input shape, with `groupsum` last. Supported older JSON formats without
+`operations` are adapted automatically.
+
+To call the engine from your own C code, use `src/model.h`:
+
+1. Call `model_init()` once with the generated model description and binary data.
+2. Call `model_workspace_bytes()` to find how much working memory to provide.
+3. Call `model_forward()` for each binarized sample, passing that workspace and
+   a variable that receives the predicted class. Check for `MODEL_OK` after
+   initialization and each inference.
+
+The C engine does not binarize raw inputs or allocate memory. Inputs must already
+use the encoder's CHW format (channel, height, width), with bits packed least
+significant first and each plane padded to whole bytes. Keep the model data and
+descriptors valid and unchanged; input, workspace and prediction buffers must
+not overlap each other or overwrite them.

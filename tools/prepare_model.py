@@ -43,9 +43,6 @@ def shape(channels, hw):
 
 # Validate and index binary sections, checking sizes, ranges and overlaps.
 def read_sections(manifest, blob):
-    version = manifest.get("format_version", 1)
-    if type(version) is not int or version != 1:
-        raise ValueError("unsupported model format_version")
     if integer(manifest["total_bytes"], "total_bytes") != len(blob):
         raise ValueError("model.bin size does not match total_bytes")
     sections = {}
@@ -271,8 +268,6 @@ def prepare_operations(manifest, blob):
         operations.append(head_operation(specs[-1]["output_shape"], manifest["head_k"], manifest["head_tau"]))
     else:
         sections = read_sections(manifest, blob)
-        if manifest.get("format_version") != 1:
-            raise ValueError("explicit operations require format_version: 1")
         encoding = manifest["encoding"]
         inputs = shape(encoding["c_in"], dimensions(encoding["in_hw"], "encoding.in_hw"))
         current = inputs
