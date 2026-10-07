@@ -146,7 +146,8 @@ the final board setup.**
 2. Install SEGGER J-Link and VS Code Cortex-Debug.
 3. Open **`general_version/`** as the VS Code workspace.
 4. In `.vscode/launch.json`, adjust `serverpath`, `armToolchainPath` and `svdFile`
-   to match your installations. Check `device` against your board
+   to match your installations: the supplied paths reflect one Windows setup
+   and may differ on your PC. Check `device` against your board
    ([Apollo4 Blue Lite: `AMA4B2KL-KXR`](https://ambiq.com/product/apollo4-blue-lite/)).
 5. In a terminal at `general_version/`, compile with `make board BACKEND=scalar`
    or `make board BACKEND=bitslice`. Select **General model - Apollo4** and press
