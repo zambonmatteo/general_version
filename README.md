@@ -93,11 +93,11 @@ so both backends support the same model format.
 
 ## Run on the PC
 
-Python **3.12+**, GCC and GNU Make must be on `PATH`. No third-party Python
-packages are required. Run from `general_version/`:
+Python **3.12+**, GCC and GNU Make must be on `PATH`. The PC targets require no
+third-party Python packages. Run from `general_version/`:
 
 ```powershell
-make                            # Scalar backend
+make host                       # Scalar backend
 make host BACKEND=bitslice       # Bitslice backend
 ```
 
@@ -127,7 +127,7 @@ make board BACKEND=bitslice
 `../../AmbiqSuite_R4.5.0`. Only add `SDK_ROOT=<your SDK installation path>` if
 the SDK is installed elsewhere.
 
-Load/debug **`bin_board/general.axf`**, which includes the model and encoded
+**`bin_board/general.axf`** includes the model and encoded
 inputs. The build also produces `general.bin` (application image without the
 bootloader), `general.map` and `general.size` (memory placement and sizes) in
 `bin_board/`.
@@ -136,45 +136,59 @@ Every preparation clears previous host and board binaries: rebuild the board
 firmware after a host run. Switching backend needs no cleanup; **`make clean`
 also empties `model/`, `input/` and `input_test/`**.
 
-## Load and run the board
+## Load and run the board from the terminal
 
-**Provisional procedure: these instructions must be updated and validated for
-the final board setup.**
+Install **SEGGER J-Link**, including [J-Link Commander](https://kb.segger.com/J-Link_Commander), and add its installation
+directory to `PATH`. The default device is `AMAP42KL-KBR`, matching the supplied
+board configuration; override it with `DEVICE=<SEGGER device name>` for another
+supported configuration. `JLINK=<executable path>` selects a Commander executable,
+and `JLINK_SERIAL=<probe serial number>` selects a particular J-Link probe.
 
-1. Connect the J-Link USB-C connector **J6** with a data cable and power the
-   board with **SW4**.
-2. Install SEGGER J-Link and VS Code Cortex-Debug.
-3. Open **`general_version/`** as the VS Code workspace.
-4. In `.vscode/launch.json`, adjust `serverpath`, `armToolchainPath` and `svdFile`
-   to match your installations: the supplied paths reflect one Windows setup
-   and may differ on your PC. Check `device` against your board
-   ([Apollo4 Blue Lite: `AMA4B2KL-KXR`](https://ambiq.com/product/apollo4-blue-lite/)).
-5. In a terminal at `general_version/`, compile with `make board BACKEND=scalar`
-   or `make board BACKEND=bitslice`. Select **General model - Apollo4** and press
-   **F5** to load and run `bin_board/general.axf`. Continue if paused and read
-   the SWO console.
-6. To repeat the measurement, stop with **Shift+F5**, clear the SWO console and
-   press **F5** again; rebuilding is unnecessary if the firmware is unchanged.
-
-For an optional PC check followed by a bitslice firmware build, run in order:
+Connect the board's J-Link USB connector **J6** with a data cable and power it
+with **SW4**. Supply the model/input files described above. Open a serial
+monitor, such as the **Serial Monitor extension in VS Code**, select the board's
+COM port and **115200 baud**, then start monitoring before loading the firmware:
 
 ```powershell
-make host BACKEND=bitslice       # Compile and run on the PC
-make board BACKEND=bitslice      # Compile firmware for the board
+make                            # Prepare, compile, flash and start the firmware
+make BACKEND=bitslice            # Same workflow with the bitslice backend
 ```
 
-Check the host's verification results before building the firmware, then load
-it with **F5**. To compare backends, repeat with `BACKEND=scalar`, keeping
-`input/inputs.bin` and `REPEATS` identical, and save each SWO report. PC timings
-do not estimate Apollo4 performance.
+The firmware uses the BSP's **UART2 at 115200 baud, 8 data bits, no parity,
+1 stop bit and no flow control**. `make` loads the ELF image with **J-Link
+Commander**, then resets and starts the firmware. J-Link exits after starting
+the board; the firmware performs its verification, timing and memory report
+autonomously. Read its output in the serial monitor. A debugger session is
+not required, and the serial monitor can stay open during programming.
 
-**F5 loads existing firmware; it does not compile it.** Rebuild after changing
-the model, inputs, code, backend or `REPEATS`. SWO assumes 96 MHz; adjust
-`cpuFrequency` for a different clock. Do not pause or step during measurements.
+Python uses only its standard library for preparation, compilation and loading;
+no additional Python packages or environment setup are needed. `PYTHON=<path>`
+selects another interpreter if required. The board runs only the compiled C
+firmware.
+
+The command finishes when programming and startup complete. Its exit status
+reports build/programming failures; firmware verification and benchmark results
+appear separately in the serial monitor. J-Link diagnostics are saved in
+`bin_board/jlink_flash.log`. To repeat the board run without recompiling or
+reloading, keep the monitor open and press the board's **RESET** button.
+
+| Command | Action |
+| --- | --- |
+| `make` / `make run` | Prepare, build, flash and start the firmware |
+| `make board` | Prepare and build firmware only |
+| `make flash` | Load and start the existing firmware, without rebuilding or capturing UART |
+| `make host` | Prepare, build and run on the PC |
+
+`flash` does not prepare model data or clear build outputs.
+Rebuild after changing the model, inputs, code, backend or `REPEATS`.
+The `scalar/` and `bitslice/` Makefiles expose the same board commands with their
+respective backends. To compare them, keep `input/inputs.bin` and `REPEATS`
+identical and save each report from the serial monitor.
+PC timings do not estimate Apollo4 performance.
 
 ## Results and measurements
 
-SWO reports verification mismatches, inference cycles/latency and memory usage.
+UART reports verification mismatches, inference cycles/latency and memory usage.
 Timing covers inference after an untimed warm-up, excluding input binarization,
 model initialization, reference comparisons and reporting.
 
@@ -190,13 +204,17 @@ Debugger values:
 
 `0 / 0` means verification was skipped. Latency is unavailable when measurement
 inputs are absent or timing checks fail. On the board, failed verification skips
-the benchmark.
+the benchmark. Invalid timing with measurement inputs or an invalid stack
+report sets `validation_status` to `3` and prints `Run completed with errors`.
+Absent measurement inputs are allowed and produce `N/A` latency, without
+running inference. `Run completed` indicates successful completion of the
+checks that had input data available.
 
 The MRAM total includes the model, embedded samples and reporting code.
 The SRAM peak estimate combines static RAM with stack usage observed before the
 memory report; it is **an estimate for this run**, not a guaranteed worst case.
-Host results are saved in `bin_host/host_report.txt`; board results are read
-from SWO/debugger.
+Host results are saved in `bin_host/host_report.txt`; board results appear in
+the serial monitor. Use its logging or copy function to save the UART report.
 
 ## Generated files and model support
 

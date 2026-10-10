@@ -46,6 +46,7 @@ static void fail(ModelStatus status)
 {
     validation_status = 3;
     am_util_stdio_printf("ERROR: model operation failed (%u)\n", (unsigned)status);
+    am_bsp_uart_printf_disable();
     while (1) { __NOP(); }
 }
 
@@ -120,7 +121,7 @@ static void measure_latency(void)
 }
 
 /* Report linked memory sizes and stack usage observed before this report. */
-static void print_memory(void)
+static int print_memory(void)
 {
     uintptr_t bottom = (uintptr_t)&__dwn_stack_start, top = (uintptr_t)&__dwn_stack_end;
     /* Mask interrupts during the stack scan, then restore their prior state. */
@@ -130,7 +131,7 @@ static void print_memory(void)
     if (sp < bottom || sp > top) {
         __set_PRIMASK(irq_state);
         am_util_stdio_printf("MEMORY ERROR: stack pointer outside reserved region\n");
-        return;
+        return 0;
     }
     /* Scan the startup marker; include unwritten space in the current frame. */
     while (cursor < top && *(volatile uint32_t *)cursor == 0xA5A5A5A5u) cursor += 4u;
@@ -152,22 +153,28 @@ static void print_memory(void)
     am_util_stdio_printf("SRAM reserved: %u bytes\n", (unsigned)(ram + reserved));
     if (margin) am_util_stdio_printf("SRAM observed peak estimate: %u bytes\n", (unsigned)(ram + observed));
     else am_util_stdio_printf("SRAM observed peak estimate: INVALID (watermark exhausted)\n");
+    return margin != 0;
 }
 
 /* Initialize the board/model, verify predictions and report benchmark results. */
 int main(void)
 {
-    /* Enable caches, board defaults and debug output. */
+    /* Enable caches, board defaults and blocking UART output (115200, 8-N-1). */
     am_hal_cachectrl_config(&am_hal_cachectrl_defaults);
     am_hal_cachectrl_enable();
     am_bsp_low_power_init();
-    if (am_bsp_debug_printf_enable()) fail(MODEL_INVALID_ARGUMENT);
+    if (am_bsp_uart_printf_enable()) {
+        validation_status = 3;
+        while (1) { __NOP(); }
+    }
     am_util_stdio_printf("\nApollo4 BL EVB implementations\n");
+    am_util_stdio_printf("Backend: %s\n", INFERENCE_BACKEND_NAME);
     /* Validate embedded model data and check the compiled workspace size. */
     ModelStatus status = model_init(&model, &model_spec, model_blob, MODEL_BLOB_BYTES);
     if (status != MODEL_OK || model_workspace_bytes(&model) != sizeof(workspace)) fail(status);
     validation_status = 1;
-    am_util_stdio_printf("Verifying predictions...\n");
+    if (TEST_COUNT) am_util_stdio_printf("Verifying predictions...\n");
+    else am_util_stdio_printf("Verification skipped (no test inputs)\n");
     /* Compare selected test inputs with their reference predictions, if supplied. */
 #if TEST_COUNT > 0
     for (uint32_t i = 0; i < TEST_COUNT; ++i) {
@@ -181,18 +188,25 @@ int main(void)
 #endif
     am_util_stdio_printf("Verification mismatches: %u / %u\n", (unsigned)validation_mismatches, (unsigned)TEST_COUNT);
     /* Skip timing on mismatches; absent tests leave the mismatch count at zero. */
-    if (!validation_mismatches) {
+    if (!validation_mismatches && MEASURE_COUNT) {
         am_util_stdio_printf("Running inference benchmark...\n");
         measure_latency();
-    } else am_util_stdio_printf("Measurements skipped (verification failed)\n");
+    } else if (validation_mismatches) am_util_stdio_printf("Measurements skipped (verification failed)\n");
+    else am_util_stdio_printf("Benchmark skipped (no measurement inputs)\n");
     if (timing.valid) {
         am_util_stdio_printf("CPU: %u Hz; runs: %u; cycles min=%u mean=%.3f max=%u\n",
             (unsigned)timing.cpu_hz, (unsigned)timing.runs, (unsigned)timing.min_cycles,
             timing.mean_cycles, (unsigned)timing.max_cycles);
         am_util_stdio_printf("Latency: %.6f ms/inference\n\n", timing.mean_ms);
     } else am_util_stdio_printf("Latency: N/A (no measurement inputs or invalid benchmark)\n\n");
-    print_memory();
-    validation_status = 2;
-    /* Keep debugger-visible results available until reset. */
+    int success = print_memory() && !validation_mismatches;
+#if MEASURE_COUNT > 0
+    success = success && timing.valid;
+#endif
+    validation_status = success ? 2u : 3u;
+    am_util_stdio_printf("Run completed%s\n", success ? "" : " with errors");
+    /* Flush the final UART bytes before powering down the interface. */
+    am_bsp_uart_printf_disable();
+    /* Preserve results until the next reset. */
     while (1) { __NOP(); }
 }
