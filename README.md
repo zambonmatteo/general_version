@@ -229,8 +229,11 @@ these four fields:
 Supported operations are convolution (`lut_conv`),
 OR pooling (`or_pool`), flattening (`flatten`), fully connected layers (`lut_fc`)
 and class selection (`groupsum`). Each operation's output shape must match the
-next input shape, with `groupsum` last. Supported older JSON formats without
-`operations` are adapted automatically.
+next input shape, with `groupsum` last. JSON without `operations` is resolved
+from its `conv` and `fc` records into the same execution descriptors. This form
+inserts OR pooling after each convolution, flatten before the FC layers and a
+final GroupSum head; pooling defaults to 2x2 and convolution stride to 1 when
+omitted. Use `operations` to declare other supported execution sequences.
 
 To call the engine from your own C code, use `src/model.h`:
 

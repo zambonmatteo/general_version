@@ -1,4 +1,4 @@
-"""Prepare a complete model, encode inputs and build/run host or board firmware."""
+"""Validate model data, encode inputs, run the host or build Apollo4 firmware."""
 
 import argparse
 import ctypes
@@ -28,7 +28,7 @@ DEFAULT_COMPILER_FLAGS = "-O2 -std=c11 -Wall -Wextra -Werror -ffp-contract=off"
 
 @dataclass
 class InputJob:
-    """One input directory and the information needed to encode its samples."""
+    """Raw-input geometry, encoding settings and selected sample indices."""
 
     group: str
     config: dict
@@ -49,7 +49,7 @@ def read_json_object(path):
 
 # Validate and return the reference prediction storage type.
 def reference_prediction_dtype(manifest):
-    """Reference-file options also belong to the single model configuration."""
+    """Read verification.prediction_dtype, defaulting class indices to uint8."""
     verification = manifest.get("verification", {})
     if not isinstance(verification, dict) or verification.keys() - {"prediction_dtype"}:
         raise ValueError("model.json: verification only accepts prediction_dtype")
@@ -118,7 +118,7 @@ def collect_input_jobs(project_dir, model_config, classes, prediction_dtype):
 
 # Load the shared C encoder and configure its ctypes signature.
 def load_c_encoder(library_path):
-    """Describe the C function's argument types so Python can call it."""
+    """Bind encode_input with its C parameter types and void return type."""
     library = ctypes.CDLL(str(library_path))
     encoder = library.encode_input
     float_pointer = ctypes.POINTER(ctypes.c_float)
@@ -183,7 +183,7 @@ def encode_input_group(encoder, job, output_dir):
         "padding": "zero_to_next_byte_per_plane",
     }
     if job.group == "input_test":
-        # Output sample i corresponds to source sample selected_indices[i].
+        # Metadata maps each encoded sample to its raw source index.
         metadata["source_count"] = config["count"]
         metadata["selected_indices"] = job.sample_indices
         if job.expected_predictions is not None:
@@ -223,7 +223,7 @@ def encode_all_groups(library_path, jobs, project_dir=PROJECT_DIR):
         prepared_output = Path(temporary_dir)
         for job in jobs:
             if job.group == "input_test":
-                # Sample positions, not values: no source position is repeated.
+                # Select distinct source indices without replacement.
                 job.sample_indices = random.SystemRandom().sample(
                     job.sample_indices, TEST_SAMPLE_COUNT
                 )
@@ -303,7 +303,7 @@ def clean_project(project_dir):
     print("Emptied model/, input/ and input_test/; removed generated build outputs.")
 
 
-# Publish staged files by replacing a validated generated directory.
+# Copy staged artifacts into a checked generated directory.
 def replace_directory(source, project_dir, name):
     """Replace a generated directory only after checking its resolved boundary."""
     clear_directory(project_dir, name)
@@ -321,7 +321,7 @@ def assembler_path(path):
 
 # Prepare model/input snapshots, C headers and assembler embedding directives.
 def prepare_deployment(project_dir, manifest, blob, header, operations, repeats, backend):
-    """Snapshot the model and embed only encoded samples, never the encoder."""
+    """Embed the model blob, encoded samples and expected class indices."""
     output = project_dir / "generated"
     measure_dir = project_dir / "bin_input/input"
     test_dir = project_dir / "bin_input/input_test"
@@ -398,8 +398,7 @@ def build_host(project_dir, compiler, flags, backend):
         command = [compiler, *shlex.split(flags), *options, "-I", str(PROJECT_DIR / "src"), "-I", str(generated),
                    *(str(source) for source in sources), str(generated / "deploy_data.S"), "-o", str(executable)]
         subprocess.run(command, check=True)
-        # Run the exact binary that will be delivered. A failing prediction
-        # prevents publication; old runnable artifacts were invalidated first.
+        # Execute the staged binary; retain it and its report only on exit code 0.
         result = subprocess.run([str(executable)], text=True, capture_output=True)
         print(result.stdout, end="")
         if result.stderr:
@@ -453,8 +452,8 @@ def build_board(project_dir, sdk_root, compiler, backend):
         sizes = subprocess.run([prefix + "size", "-A", str(target)], check=True, capture_output=True, text=True)
         (staging / "general.size").write_text(sizes.stdout, encoding="utf-8")
         subprocess.run([prefix + "size", str(target)], check=True)
-        # Only useful firmware artifacts are retained; temporary objects and
-        # compiler stack-usage files are removed automatically.
+        # Retain the linked image, binary, map and size reports. Remove object
+        # files and per-function stack-usage reports from the staged output.
         for obj in objects:
             obj.unlink()
         for path in staging.glob("*.su"):
@@ -485,9 +484,8 @@ def main():
     if arguments.target == "clean":
         clean_project(project_dir)
         return
-    # All preparation targets use the same model and randomly selected test set.
-    # Remove old runnable artifacts before any new preparation can fail: the
-    # debugger must never silently load yesterday's firmware after a failed make.
+    # Invalidate both build directories before preparing replacement data so
+    # failed preparation cannot leave an executable for a different model.
     clear_directory(project_dir, "bin_host")
     clear_directory(project_dir, "bin_board")
     model_dir = arguments.model_dir.resolve() if arguments.model_dir else project_dir / "model"

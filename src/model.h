@@ -10,7 +10,7 @@ typedef struct {
     uint32_t width;
 } TensorShape;
 
-/* A view of one LUT. Both pointers refer to the original, immutable blob.
+/* A view of one LUT. Both pointers refer to the immutable model blob.
  * Input j contributes bit j of the table address (least significant first).
  * The mapper's interpretation belongs to the layer, not to this view. */
 typedef struct {
@@ -39,7 +39,7 @@ typedef struct {
     uint32_t stride_w;
 } ConvGeometry;
 
-/* Generated from JSON on the PC. These descriptors can stay in Flash.
+/* Generated from JSON on the PC; constant descriptors use read-only storage.
  * FC vectors use shape {1, 1, number_of_bits}; convolution uses CHW.
  * FC convolution parameters are zero and are never used. */
 typedef struct {
@@ -71,7 +71,7 @@ typedef struct {
 
 typedef struct {
     uint32_t classes;
-    float tau;  /* Float32 divisor, including reference rounding/tie behavior. */
+    float tau;  /* Positive finite float32 divisor for class population counts. */
 } GroupSumHead;
 
 typedef enum {
@@ -123,8 +123,9 @@ typedef enum {
 ModelStatus lut_layer_bind(LutLayer *layer, const LutLayerSpec *spec,
                            const uint8_t *blob, size_t blob_bytes);
 
-/* Retrieve one small view, not a permanently allocated array of LUT objects.
- * layer must have been successfully bound. On failure, lut is cleared. */
+/* Populate a LUT view with pointers to its table and routing indices.
+ * The layer must be bound and k must be below its LUT count.
+ * On failure, lut is cleared. */
 ModelStatus lut_layer_get(const LutLayer *layer, uint32_t k, Lut *lut);
 
 /* Read one mapper entry without assuming pointer alignment or host endianness.

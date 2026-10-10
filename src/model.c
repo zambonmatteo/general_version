@@ -213,7 +213,7 @@ ModelStatus lut_layer_bind(LutLayer *layer, const LutLayerSpec *spec,
     }
 
     LutLayer bound = {spec, blob + spec->tables.offset, blob + spec->indices.offset};
-    /* Validate routing once, including every LUT, before publishing the layer. */
+    /* Validate all LUT routing indices before assigning the bound layer. */
     for (uint32_t k = 0; k < spec->n_luts; ++k) {
         Lut lut;
         (void)lut_layer_get(&bound, k, &lut);

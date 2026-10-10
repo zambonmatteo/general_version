@@ -42,7 +42,6 @@ static uint32_t cpu_clock_hz(void)
 }
 #endif
 
-/* Report a model error and halt for debugger inspection. */
 static void fail(ModelStatus status)
 {
     validation_status = 3;
@@ -50,7 +49,6 @@ static void fail(ModelStatus status)
     while (1) { __NOP(); }
 }
 
-/* Measure repeated inference with DWT cycles and publish validated timing. */
 static void measure_latency(void)
 {
 #if MEASURE_COUNT > 0

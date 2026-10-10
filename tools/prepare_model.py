@@ -1,8 +1,8 @@
-"""Validate a model export and generate its complete C execution descriptor.
+"""Validate model JSON and binary sections, then generate C descriptors.
 
-JSON is read only on the PC. The firmware uses constant descriptors and views
-of the original blob. Explicit operations are preferred; the legacy adapter
-encodes the documented conventions of the professor's existing exports.
+The PC resolves either an explicit 'operations' sequence or 'conv'/'fc' records
+into LUT, pooling, flatten and GroupSum operations. The firmware uses constant
+descriptors and reads model data directly from the immutable binary blob.
 """
 
 import argparse
@@ -25,7 +25,7 @@ def integer(value, name, minimum=1):
 
 # Normalize a square size or [height, width] pair into validated dimensions.
 def dimensions(value, name):
-    """Legacy exports use a scalar for square shapes and [H, W] otherwise."""
+    """Expand an integer to [size, size] or validate a [height, width] pair."""
     if type(value) is int:
         value = [value, value]
     if not isinstance(value, list) or len(value) != 2:
@@ -72,10 +72,10 @@ def read_sections(manifest, blob):
 
 # Find the unique LUT table/index pair matching supported section prefixes.
 def lut_sections(sections, prefixes):
-    """Accept the two naming conventions used by the professor's exports.
+    """Resolve one prefix with '_tab' and '_idx' binary sections.
 
-    '_pw' is an export name here; the geometry always comes from JSON, so it
-    does not imply a pointwise convolution or determine the kernel size.
+    A '_pw' suffix is part of the section label. Kernel dimensions, padding
+    and stride are read from the JSON layer fields.
     """
     matches = [prefix for prefix in prefixes if prefix + "_tab" in sections]
     if len(matches) != 1:
@@ -143,7 +143,7 @@ def layer_spec(sections, prefixes, layer, input_shape, output_shape,
     }
 
 
-# Convert supported legacy convolution and FC records into LUT descriptors.
+# Build LUT descriptors from JSON 'conv' and 'fc' records.
 def prepare_specs(manifest, blob):
     sections = read_sections(manifest, blob)
     encoding = manifest["encoding"]
@@ -151,8 +151,7 @@ def prepare_specs(manifest, blob):
     geometry = manifest.get("geometry", {})
     specs = []
     for b, block in enumerate(manifest["conv"]):
-        # This adapter supports the existing one-learnable-layer-per-block
-        # exports. Reject other structures rather than silently skipping them.
+        # Each 'conv' block must contain exactly one learnable LUT layer.
         if len(block) != 1 or block[0]["kind"] != "learnable":
             raise ValueError("expected one learnable LUT convolution per block")
         layer = block[0]
@@ -165,8 +164,7 @@ def prepare_specs(manifest, blob):
         ph, pw = (pad, pad) if type(pad) is int else pad
         ph = integer(ph, "conv.padding_h", 0)
         pw = integer(pw, "conv.padding_w", 0)
-        # These legacy exports omit stride and use stride 1. Keep this export
-        # convention in the PC adapter, not in the inference engine.
+        # Resolve an omitted stride to [1, 1] in the generated descriptor.
         sh, sw = dimensions(layer.get("stride", 1), "conv.stride")
         specs.append(layer_spec(sections, [f"block{b + 1}", f"block{b + 1}_pw"],
                                 layer, inputs, outputs, (kh, kw, ph, pw, sh, sw), blob))
@@ -180,8 +178,8 @@ def prepare_specs(manifest, blob):
     exported = {name for name in sections if name.endswith(("_tab", "_idx"))}
     if consumed != exported:
         raise ValueError("unmapped LUT sections in the model export")
-    # Pooling and flatten are intentionally not inferred from shape changes.
-    # Connectivity will be checked when the explicit operation sequence exists.
+    # prepare_operations inserts pooling and flatten descriptors, then checks
+    # that each operation's input shape matches the preceding output shape.
     return input_shape, specs
 
 
@@ -223,8 +221,7 @@ def head_operation(inputs, classes, tau):
         raise ValueError("GroupSum requires equal class groups in a flat vector")
     if type(tau) not in (float, int) or not math.isfinite(tau) or not 0 < tau <= 3.402823466e38:
         raise ValueError("GroupSum tau must be finite, positive and fit float32")
-    # The C head preserves float32 division and its tie behavior. Reject
-    # underflow to zero in the firmware representation.
+    # Reject a divisor that rounds to zero in its float32 representation.
     if struct.unpack("<f", struct.pack("<f", tau))[0] == 0:
         raise ValueError("GroupSum tau underflows float32")
     return {"type": "OP_GROUP_SUM", "input_shape": inputs,
@@ -237,7 +234,7 @@ def lut_operation(spec, index):
             "output_shape": spec["output_shape"], "lut": index}
 
 
-# Build and validate the execution sequence from explicit or legacy JSON.
+# Build and validate operations from an explicit list or 'conv'/'fc' records.
 def prepare_operations(manifest, blob):
     """Normalize a linear network to explicit LUT/pool/flatten/head operations."""
     if "operations" not in manifest:
@@ -247,14 +244,13 @@ def prepare_operations(manifest, blob):
         pool_kernels = geometry.get("pool_k", manifest.get("arch", {}).get("pool"))
         conv_count = len(manifest["conv"])
         if not conv_count or not manifest["fc"]:
-            raise ValueError("legacy exports require convolution and FC layers; use explicit operations otherwise")
+            raise ValueError("JSON without operations requires convolution and FC layers; declare operations for other networks")
         if pool_kernels is not None and len(pool_kernels) != conv_count:
-            raise ValueError("one pool kernel is required for every legacy convolution block")
+            raise ValueError("JSON without operations requires one pool kernel per convolution block")
         for i, spec in enumerate(specs[:conv_count]):
             operations.append(lut_operation(spec, i))
-            # Legacy image exports prescribe 2x2 OR pooling after every block;
-            # KWS exports specify rectangular windows. This convention is
-            # confined to this adapter and is made explicit in generated C.
+            # Insert OR pooling after each convolution. Use the declared kernel
+            # or default to [2, 2]; pooling stride equals the kernel dimensions.
             kernel = pool_kernels[i] if pool_kernels is not None else [2, 2]
             pool = pool_operation(spec["output_shape"], kernel, kernel)
             if "pool_hw" in geometry and tuple(geometry["pool_hw"][i]) != pool["output_shape"][1:]:
@@ -337,7 +333,8 @@ def model_encoding(manifest, blob):
     edges = encoding["edges"]
     if encoding["n_edge_ch"] != (10 if edges else 0) or encoding["c_in"] != c * bits + (10 if edges else 0):
         raise ValueError("encoded channels disagree with thermometer/edge settings")
-    dtype = encoding.get("input_dtype", "uint8")  # Legacy image-export convention.
+    # JSON without 'operations' defaults an omitted input_dtype to uint8.
+    dtype = encoding.get("input_dtype", "uint8")
     if dtype not in ("uint8", "float32"):
         raise ValueError("input_dtype must be uint8 or float32")
     # Read a float32 section with the expected shape and require finite values.

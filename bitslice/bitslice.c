@@ -1,9 +1,9 @@
 #include "bitslice.h"
 #include <string.h>
 
-/* Adapted from common/bitslice.h and the old KWS kernels. The packed CHW
- * layout, LSB-first table address and per-channel byte padding are unchanged.
- * Geometry and mapper entries now come from the general LUT structs. */
+/* Evaluate convolution and OR pooling on 32-bit words of one encoded sample.
+ * CHW planes use LSB-first bits and independent byte padding. Layer descriptors
+ * supply convolution geometry and LUT routing indices. */
 static uint32_t low_mask(uint32_t bits)
 {
     return bits >= BS_WORD_BITS ? UINT32_MAX : (UINT32_C(1) << bits) - 1u;
@@ -21,8 +21,8 @@ static uint32_t load_word(const uint8_t *plane, int32_t word, uint32_t bytes)
     if (start >= bytes) return 0;
     if (bytes - start >= 4u) {
         uint32_t value;
-        /* The deployment tools require a little-endian host, as is Apollo4.
-         * memcpy also allows unaligned, independently byte-padded planes. */
+        /* Word loads require little-endian byte order. memcpy accepts unaligned
+         * plane addresses caused by independent per-channel byte padding. */
         memcpy(&value, plane + start, sizeof(value));
         return value;
     }
@@ -52,8 +52,6 @@ static void store_word(uint8_t *plane, uint32_t word, uint32_t value, uint32_t b
         plane[start + b] = (uint8_t)(value >> (8u * b));
 }
 
-/* Each bit lane evaluates the same truth table at a different position.
- * The first mux level reduces each pair of table bits to 0, ~t0, t0 or ~0. */
 static uint32_t evaluate_word(const Lut *lut, const uint32_t *taps, uint32_t *values)
 {
     const uint32_t select[4] = {0, ~taps[0], taps[0], UINT32_MAX};
@@ -73,8 +71,7 @@ int bitslice_conv_supported(const LutLayerSpec *s)
     if (!s || s->type != LUT_CONVOLUTION || !s->n_inputs || s->n_inputs > BS_MAX_INPUTS)
         return 0;
     const ConvGeometry *g = &s->convolution;
-    /* Current kernels slice adjacent columns, so spatial strides must be one.
-     * Conservative coordinate bounds also keep all signed reads safe. */
+    
     return g->stride_h == 1u && g->stride_w == 1u &&
         (uint64_t)s->input_shape.height * s->input_shape.width <= BS_MAX_POSITIONS &&
         (uint64_t)s->output_shape.height * s->output_shape.width <= BS_MAX_POSITIONS &&
@@ -82,8 +79,8 @@ int bitslice_conv_supported(const LutLayerSpec *s)
         g->padding_h <= BS_MAX_POSITIONS && g->padding_w <= BS_MAX_POSITIONS;
 }
 
-/* Mask linear shifts that would wrap horizontally into another row.
- * Cache nine masks per word for the common 3x3, same-padding convolution. */
+/* Mask bit shifts that cross a row or tensor boundary. A 3x3 convolution with
+ * one-cell padding uses nine masks per word, one for each kernel position. */
 static uint32_t same_mask(uint32_t word, uint32_t h, uint32_t w, int32_t dr, int32_t dc)
 {
     const uint32_t base = word * BS_WORD_BITS, positions = h * w;
@@ -218,8 +215,8 @@ void bitslice_conv_forward(const LutLayer *layer, const uint8_t *input, uint8_t 
     else forward_rows(layer, input, output);
 }
 
-/* The old implementation's 256-byte Flash table compacts pairs of binary
- * columns. Applying it twice implements a four-column OR, as used by KWS. */
+/* Map each byte to four OR results from adjacent bit pairs. Repeated lookup
+ * compacts groups of 2, 4 or 8 columns for horizontal OR pooling. */
 #define P4(b) ((uint8_t)((((b) | ((b) >> 1)) & 1u) \
     | (((((b) >> 2) | ((b) >> 3)) & 1u) << 1) \
     | (((((b) >> 4) | ((b) >> 5)) & 1u) << 2) \

@@ -126,9 +126,9 @@ static void forward_conv(const LutLayer *layer, const uint8_t *input, uint8_t *o
         uint32_t row, column;
     } taps[31];
 
-    /* Ordinary model dimensions fit signed 32-bit coordinates. Prove every
-     * intermediate safe once per layer, outside the pixel loop. Preserve the
-     * wide path for valid geometries that need more than 32 signed bits. */
+    /* Select int32_t coordinates when dimensions, padding and maximum kernel
+     * offsets fit INT32_MAX. Use int64_t for all other validated geometries;
+     * evaluate these bounds once per layer, outside the output loops. */
     const int use_narrow = input_height <= INT32_MAX && input_width <= INT32_MAX &&
         g->padding_h <= INT32_MAX && g->padding_w <= INT32_MAX &&
         (uint64_t)(height - 1u) * g->stride_h + g->kernel_h - 1u <= INT32_MAX &&

@@ -21,14 +21,14 @@ ModelStatus tensor_pool_shape(TensorShape input, PoolGeometry geometry, TensorSh
 ModelStatus tensor_or_pool(const uint8_t *input, size_t input_bytes, TensorShape shape,
                            PoolGeometry geometry, uint8_t *output, size_t output_bytes);
 
-/* Repack CHW planes into one flat vector: per-channel byte padding is removed,
- * while channel/row/column order is preserved. This is not a memcpy. */
+/* Repack CHW planes into one flat vector, removing per-channel byte padding
+ * while preserving channel/row/column bit order. */
 ModelStatus tensor_flatten(const uint8_t *input, size_t input_bytes, TensorShape shape,
                            uint8_t *output, size_t output_bytes);
 
 /* Sum consecutive equal-size class groups, divide each count by float32 tau
  * and return argmax. Equal float32 scores choose the lowest class index,
- * including rounding/overflow ties, as in the reference implementation. */
+ * including ties caused by float32 rounding or division overflow. */
 ModelStatus tensor_group_argmax(const uint8_t *input, size_t input_bytes,
                                 uint32_t bits, uint32_t classes, float tau,
                                 uint32_t *prediction);
