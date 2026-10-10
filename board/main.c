@@ -9,19 +9,15 @@
  * MRAM. Input binarization runs on the PC. */
 static Model model;
 static uint8_t workspace[MODEL_WORKSPACE_BYTES];
-volatile uint32_t validation_status = 0;  /* 0=start, 1=running, 2=done, 3=error */
 volatile uint32_t validation_mismatches = 0;
-volatile uint32_t validation_predictions[TEST_COUNT ? TEST_COUNT : 1];
-volatile uint32_t measurement_predictions_valid = 0;
 #if MEASURE_COUNT > 0
 volatile uint32_t measurement_predictions[MEASURE_COUNT];
 #endif
 
-/* Debugger-visible benchmark results; valid is set only after all checks pass. */
+/* Benchmark statistics; valid is set only after all timing checks pass. */
 typedef struct {
     uint32_t valid, runs, cpu_hz, cpu_hz_end;
     uint32_t min_cycles, max_cycles, mismatches;
-    uint64_t total_cycles;
     double mean_cycles, mean_ms;
 } Timing;
 volatile Timing timing;
@@ -44,7 +40,6 @@ static uint32_t cpu_clock_hz(void)
 
 static void fail(ModelStatus status)
 {
-    validation_status = 3;
     am_util_stdio_printf("ERROR: model operation failed (%u)\n", (unsigned)status);
     am_bsp_uart_printf_disable();
     while (1) { __NOP(); }
@@ -54,8 +49,7 @@ static void measure_latency(void)
 {
 #if MEASURE_COUNT > 0
     timing.valid = 0;
-    /* Untimed warm-up records baselines, valid only after all inferences succeed.
-     * Predictions remain available even if timers cannot be used. */
+    /* Run untimed inferences to record baseline predictions for consistency checks. */
     for (uint32_t i = 0; i < MEASURE_COUNT; ++i) {
         uint32_t prediction;
         ModelStatus status = model_forward(&model, measure_inputs + (size_t)i * MODEL_INPUT_BYTES,
@@ -63,7 +57,6 @@ static void measure_latency(void)
         if (status != MODEL_OK) fail(status);
         measurement_predictions[i] = prediction;
     }
-    measurement_predictions_valid = 1;
     timing.cpu_hz = cpu_clock_hz();
     if (!timing.cpu_hz) return;
 
@@ -112,7 +105,6 @@ static void measure_latency(void)
     /* Final timing requires a stable clock and matching baseline predictions. */
     timing.cpu_hz_end = cpu_clock_hz();
     timing.min_cycles = minimum; timing.max_cycles = maximum;
-    timing.total_cycles = total;
     if (timing.cpu_hz_end != timing.cpu_hz || timing.mismatches) return;
     timing.mean_cycles = (double)total / timing.runs;
     timing.mean_ms = timing.mean_cycles * 1000.0 / timing.cpu_hz;
@@ -164,7 +156,6 @@ int main(void)
     am_hal_cachectrl_enable();
     am_bsp_low_power_init();
     if (am_bsp_uart_printf_enable()) {
-        validation_status = 3;
         while (1) { __NOP(); }
     }
     am_util_stdio_printf("\nApollo4 BL EVB implementations\n");
@@ -172,7 +163,6 @@ int main(void)
     /* Validate embedded model data and check the compiled workspace size. */
     ModelStatus status = model_init(&model, &model_spec, model_blob, MODEL_BLOB_BYTES);
     if (status != MODEL_OK || model_workspace_bytes(&model) != sizeof(workspace)) fail(status);
-    validation_status = 1;
     if (TEST_COUNT) am_util_stdio_printf("Verifying predictions...\n");
     else am_util_stdio_printf("Verification skipped (no test inputs)\n");
     /* Compare selected test inputs with their reference predictions, if supplied. */
@@ -182,7 +172,6 @@ int main(void)
         status = model_forward(&model, test_inputs + (size_t)i * MODEL_INPUT_BYTES, MODEL_INPUT_BYTES,
                                workspace, sizeof(workspace), &prediction);
         if (status != MODEL_OK) fail(status);
-        validation_predictions[i] = prediction;
         if (prediction != test_expected[i]) ++validation_mismatches;
     }
 #endif
@@ -203,10 +192,9 @@ int main(void)
 #if MEASURE_COUNT > 0
     success = success && timing.valid;
 #endif
-    validation_status = success ? 2u : 3u;
     am_util_stdio_printf("Run completed%s\n", success ? "" : " with errors");
     /* Flush the final UART bytes before powering down the interface. */
     am_bsp_uart_printf_disable();
-    /* Preserve results until the next reset. */
+    /* Wait for the next reset after reporting. */
     while (1) { __NOP(); }
 }

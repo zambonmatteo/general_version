@@ -422,8 +422,8 @@ def build_board(project_dir, sdk_root, compiler, backend):
                 sdk_root / "CMSIS/ARM/Include", sdk_root / "CMSIS/AmbiqMicro/Include",
                 sdk_root / "devices", sdk_root / "mcu/apollo4l", sdk_root / "mcu/apollo4l/hal",
                 sdk_root / "utils", bsp]
-    flags = arch + ["-std=c11", "-O2", "-g3", "-Wall", "-Wextra", "-Wno-unused-parameter",
-                    "-ffp-contract=off", "-ffunction-sections", "-fdata-sections", "-fstack-usage",
+    flags = arch + ["-std=c11", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter",
+                    "-ffp-contract=off", "-ffunction-sections", "-fdata-sections",
                     "-DPART_apollo4l", "-DAM_PACKAGE_BGA", "-DAM_PART_APOLLO4L", "-Dgcc"]
     flags += [argument for path in includes for argument in ("-I", str(path))]
     sources = [PROJECT_DIR / "board" / name for name in ("main.c", "startup_gcc.c")]
@@ -453,12 +453,9 @@ def build_board(project_dir, sdk_root, compiler, backend):
         sizes = subprocess.run([prefix + "size", "-A", str(target)], check=True, capture_output=True, text=True)
         (staging / "general.size").write_text(sizes.stdout, encoding="utf-8")
         subprocess.run([prefix + "size", str(target)], check=True)
-        # Retain the linked image, binary, map and size reports. Remove object
-        # files and per-function stack-usage reports from the staged output.
+        # Retain the linked image, binary, map and size reports; remove object files.
         for obj in objects:
             obj.unlink()
-        for path in staging.glob("*.su"):
-            path.unlink()
         (staging / "build_info.json").write_text(json.dumps({"backend": backend}, indent=2) + "\n", encoding="utf-8")
         replace_directory(staging, project_dir, "bin_board")
     print(f"Board firmware: {project_dir / 'bin_board/general.axf'}")
