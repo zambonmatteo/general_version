@@ -1,250 +1,423 @@
 # General DWNN implementation
 
-A reusable **C inference engine with scalar and bitslice backends** for MNIST, CIFAR-10 and KWS
-models, with a PC preparation pipeline and firmware for the **Ambiq Apollo4 Blue
-Lite EVB**. One codebase executes LUT convolution, LUT fully connected, binary OR
-pooling, CHW flatten and GroupSum/argmax from generated model descriptors.
+A reusable C inference engine with **scalar and bitslice backends** for exported
+MNIST, CIFAR and KWS LUT models, with a PC preparation pipeline and firmware
+for the **Ambiq Apollo4 Blue Lite EVB**.
 
-The PC reads JSON, checks the blob and binarizes inputs. The board receives the
-original model blob, constant descriptors and **already encoded inputs**.
+The normal workflow is:
 
-## Files to provide
+1. Supply a model, raw inputs and matching reference predictions.
+2. Optionally check the model on the PC with `make host`.
+3. Open a serial monitor to receive the board's output.
+4. Run `make` to prepare, compile, load and start the firmware.
+5. Read verification, latency and memory results in the serial monitor.
+
+The PC validates JSON and binary data and binarizes inputs. The board executes
+inference using the embedded model, generated descriptors and already encoded
+inputs. Loading uses **J-Link Commander**; output uses **UART**. The firmware
+runs autonomously after loading, without a VS Code debugger session.
+
+## 1. Install the required tools
+
+| Tool | Purpose |
+| --- | --- |
+| Python 3.12 or later | Model preparation, input encoding and build/loading orchestration |
+| GCC | Compile the PC input encoder and the optional host executable |
+| GNU Make | Run the commands in this guide |
+| Arm GNU Toolchain (`arm-none-eabi-gcc`, `arm-none-eabi-objcopy`, `arm-none-eabi-size`) | Compile and inspect Apollo4 firmware |
+| AmbiqSuite SDK 4.5.0 | Apollo4 HAL, BSP, headers and utility sources |
+| SEGGER J-Link, including [J-Link Commander](https://kb.segger.com/J-Link_Commander) | Load and start the firmware |
+| A serial monitor | Display UART output from the board |
+
+Add Python, Make, compiler and J-Link executable directories to `PATH`.
+**GCC is also required for board builds with raw input samples**, because
+input encoding runs on the PC.
+On Windows, use a GCC build targeting the same architecture as Python
+(for example, 64-bit MinGW-w64 with 64-bit Python), so Python can load the
+encoder DLL.
+Python uses only its standard library; no virtual environment or third-party
+Python packages are required.
+
+The SDK's HAL and BSP libraries must already be built at:
+
+```text
+AmbiqSuite_R4.5.0/
+  mcu/apollo4l/hal/mcu/gcc/bin/libam_hal.a
+  boards/apollo4l_blue_evb/bsp/gcc/bin/libam_bsp.a
+```
+
+The default SDK path is `../../AmbiqSuite_R4.5.0`, relative to this project.
+An `AMBIQ_SDK_ROOT` environment variable overrides that default. Alternatively,
+pass the installation path explicitly:
+
+```powershell
+make BACKEND=scalar SDK_ROOT="C:/SDK/AmbiqSuite_R4.5.0"
+```
+
+VS Code is optional. The commands can run in a normal terminal, and any suitable
+serial terminal can receive the output.
+
+## 2. Open the project and start from a clean state
+
+The examples use **Windows PowerShell**. Open a terminal in `general_version/`.
+For example, replace the path below with your project location:
+
+```powershell
+cd C:\path\to\general_version
+```
+
+To start from an empty local setup, run this **before copying the new data**:
+
+```powershell
+make clean
+```
+
+This command removes the contents of `model/`, `input/` and `input_test/`,
+recreating their `.gitkeep` files. It also removes `bin_input/`, `generated/`,
+`bin_host/` and `bin_board/`. Source files, the SDK and model/data directories
+outside this project are preserved.
+
+Skip this cleanup if you want to reuse data already supplied in the project.
+Switching between scalar and bitslice does not require `make clean`.
+
+## 3. Supply the model and input files
+
+Prepare this directory structure:
 
 ```text
 general_version/
   model/
-    model.bin             Original LUT tables, routing indices and thresholds
-    model.json            Sections, encoding and network operations
+    model.json
+    model.bin
   input/
-    inputs.bin            Samples for inference measurements
+    inputs.bin
   input_test/
-    inputs.bin            At least ten verification samples, when supplied
-    ref_preds.bin         Reference model prediction for every source sample
+    inputs.bin
+    ref_preds.bin
 ```
 
-Replace both model files together to change models, and supply matching raw
-inputs and reference predictions. During preparation, `generated/model_specs.h`
-is automatically generated from `model.json`. This C header contains the layer
-descriptors, tensor shapes and sequence of operations used by the inference
-engine. A separate `model_meta.h` is not required. Alternatively select an
-existing model directory with `MODEL_DIR`; input files are still read from
-`general_version/input/` and `general_version/input_test/`.
+| File | What to provide |
+| --- | --- |
+| `model/model.json` | Exported model description, encoding settings and network geometry/operations |
+| `model/model.bin` | Matching LUT tables, routing indices and encoding thresholds |
+| `input/inputs.bin` | Raw timing samples; at least one sample enables the benchmark |
+| `input_test/inputs.bin` | Raw verification samples; at least ten samples enable verification |
+| `input_test/ref_preds.bin` | This model's reference class prediction for every raw verification sample, in the same order |
 
-**`model.json` is the only configuration file and is mandatory**
-for preparation, encoding and building. Sample counts are always inferred from
-each input binary's size; partial samples are rejected.
+**Replace `model.json` and `model.bin` together.** When changing models, supply
+reference predictions from the new model as well. Raw inputs can be reused only
+if their shape, type and preprocessing match the new model's input requirements.
 
-Raw inputs contain consecutive, headerless CHW samples. Shape and type (`uint8`
-or little-endian `float32`) are determined from `model.json`. The encoder divides
-`uint8` values by 255; float32 values must already match the reference model's
-input scale and preprocessing.
+`model.json` is the only configuration file. Sample counts are inferred from
+binary file sizes. Preparation generates `generated/model_specs.h` automatically;
+you do not need to copy `model_meta.h` or write a C descriptor by hand.
+Do not place `config.json` in `input/` or `input_test/`; preparation rejects it.
 
-`input_test/ref_preds.bin` defaults to one `uint8` class index per source sample,
-in the same order as `inputs.bin`. For little-endian `uint32` predictions, add
-this top-level field to **`model.json`**:
+### Raw input format
+
+Each `inputs.bin` contains consecutive, headerless samples in **CHW order**
+(channel, height, width). Raw shape comes from `encoding.in_ch` and
+`encoding.in_hw` in `model.json`; raw type comes from `encoding.input_dtype`:
+
+- `uint8`: one byte per value; the PC encoder divides values by 255.
+- Little-endian `float32`: four bytes per value; values must already have the
+  preprocessing and scale expected by the reference model.
+
+Models with an explicit `operations` list must declare `encoding.input_dtype`.
+For exports without `operations`, an omitted input type defaults to `uint8`.
+
+Both backends use the same raw input format. The PC encodes these inputs before
+embedding them in the firmware.
+
+Reference predictions default to **one `uint8` class index per raw test sample**.
+To use little-endian `uint32` class indices, add this top-level field to
+`model.json`:
 
 ```json
 "verification": {"prediction_dtype": "uint32"}
 ```
 
-Inputs are binarized on the PC using `model.json` settings and `model.bin`
-thresholds.
+Preparation randomly selects ten distinct verification source indices and keeps
+inputs and predictions aligned. With exactly ten supplied samples, all ten are
+checked, possibly in a different order. All samples supplied in `input/` are
+used for timing, in file order.
+All encoded measurement samples are embedded in firmware, so select a subset
+that fits in board memory together with the model.
 
-All samples in `input/inputs.bin` are saved as binary inputs in
-`bin_input/input/encoded.bin`, then used to measure average inference time over
-`REPEATS` runs per sample (10 by default). Binarization is excluded from timing.
+## 4. Optionally verify on the PC
 
-For verification, **10 distinct samples** are selected randomly from
-`input_test/inputs.bin` and binarized into
-`bin_input/input_test/encoded.bin`. Their predicted classes are compared with the
-corresponding predictions from `input_test/ref_preds.bin` to check agreement
-with the reference model. Verification is skipped if its input file is missing,
-empty or contains fewer than ten samples. Each preparation reselects the test
-samples; measurement inputs retain their file order.
+Run:
 
-`tools/run.py` automatically creates `encoded_meta.json` beside each `encoded.bin`.
-It records the sample count, shape and binary layout, plus the selected source
-indices for verification, and is used to prepare the embedded input data.
+```powershell
+make host BACKEND=scalar
+```
 
-## Source layout and backend selection
-
-The layout retains separate `scalar/` and `bitslice/` entry points while sharing model data and the deployment pipeline:
+With ten test inputs and matching reference predictions, expect:
 
 ```text
-general_version/
-  scalar/Makefile       Scalar build entry point
-  bitslice/Makefile     Bitslice build entry point
-  bitslice/bitslice.h   Kernel limits, support checks and internal interfaces
-  bitslice/bitslice.c   Word-parallel convolutions and OR pooling
-
-  src/                 Shared model/LUT structs, scalar kernels and host runner
-  board/               Shared Apollo4 benchmark, startup and linker script
-  tools/               Shared JSON preparation, encoder and build orchestration
-  model/, input/, input_test/   Shared external data
+Verification mismatches: 0 / 10
 ```
 
-`BACKEND=scalar` is the default. Set `BACKEND=bitslice` to enable word-parallel
-LUT convolution and OR pooling, processing up to **32 spatial positions of one
-sample** at a time. FC layers, flatten and GroupSum remain scalar.
-
-Both backends share the same model files, graph executor and two activation
-buffers. Layers unsupported by bitslice **automatically fall back to scalar**,
-so both backends support the same model format.
-
-## Run on the PC
-
-Python **3.12+**, GCC and GNU Make must be on `PATH`. No third-party Python
-packages are required. Run from `general_version/`:
+Each check also prints the source index, predicted class and expected class.
+A mismatch makes the host command fail. You can check bitslice similarly:
 
 ```powershell
-make                            # Scalar backend
-make host BACKEND=bitslice       # Bitslice backend
+make host BACKEND=bitslice
 ```
 
-Each command prepares the model and inputs, compiles and runs the host
-executable, and reports verification results and average **PC inference time**,
-subject to `clock()` resolution.
-A verification mismatch fails the command. Successful runs save the executable
-and `host_report.txt` in `bin_host/`.
+Host results are saved in `bin_host/host_report.txt` only when the command
+succeeds; on failure, read the terminal output. PC timing uses `clock()`
+and describes the PC's performance; use the board's UART report to measure
+Apollo4 latency.
 
-Add `REPEATS=<count>` to change repetitions or `MODEL_DIR=<path>` to select a
-model directory. `make encode` only binarizes inputs; `make prepare` also
-generates deployment data. Neither builds an executable.
+Every preparation, including `make encode`, clears both previous host and
+board build directories.
+Save a host report elsewhere if you need it after the next build, and rebuild
+board firmware after running `make host`.
 
-## Build for Apollo4
+## 5. Connect the board and open a serial monitor
 
-In addition to the PC requirements, install Arm GNU Toolchain with its `bin/`
-directory on `PATH`, and **AmbiqSuite SDK 4.5.0** with its HAL and BSP libraries
-built. From
-`general_version/`, choose one backend:
+1. Connect the board's **J-Link USB connector J6** with a data cable.
+2. Power the board using **SW4**.
+3. Find the serial port assigned to the board. The validated Windows setup used
+   **COM4**; the port number can differ on another PC.
+4. Open your chosen serial monitor with the settings below.
+5. Start receiving **before loading the firmware**, so its initial messages
+   are captured.
+
+The firmware uses the BSP's UART2 with these settings:
+
+| Setting | Value |
+| --- | --- |
+| Baud rate | **115200** |
+| Data bits | **8** |
+| Parity | **None** |
+| Stop bits | **1** |
+| Flow control | **None** |
+
+### Tested reader: Microsoft Serial Monitor for VS Code
+
+The VS Code extension used to validate this project is
+**[Serial Monitor by Microsoft](https://marketplace.visualstudio.com/items?itemName=ms-vscode.vscode-serial-monitor)**,
+extension ID **`ms-vscode.vscode-serial-monitor`**.
+
+1. Install the extension from the VS Code Extensions view.
+2. Open the bottom panel, for example with **Terminal > New Terminal**, and
+   select the **Serial Monitor** tab.
+3. Open a monitor if none is present.
+4. Set **Monitor Mode** to **Serial** and **View Mode** to **Text**.
+5. Select the board's **Port**, for example **COM4**.
+6. Set **Baud rate** to **115200** and **Line ending** to **None**. Use the
+   serial parameters in the table above for any additional settings.
+7. Click **Start Monitoring**, then run the board command from the next step.
+
+The firmware processes embedded inputs automatically, so there is no command
+or sample to type into the monitor. Line-ending selection concerns transmitted
+text and does not control how the firmware's output is received.
+
+The VS Code Serial Monitor extension was used for this project, but you can use any serial terminal you prefer with the settings above.
+
+## 6. Compile, load and start the firmware
+
+With the serial monitor receiving, run:
 
 ```powershell
-make board BACKEND=scalar
+make BACKEND=scalar
+```
+
+`make` without arguments performs the same scalar workflow. For bitslice, use:
+
+```powershell
+make BACKEND=bitslice
+```
+
+The command performs these actions in order:
+
+1. Validate the model and available input/reference files.
+2. Encode inputs and generate the model/deployment descriptors.
+3. Compile the selected backend and link the firmware.
+4. Load `bin_board/general.axf` using J-Link Commander.
+5. Reset and start the processor, then exit J-Link.
+
+The board then runs verification and timing and prints its report over UART.
+**The terminal running `make` shows build/loading messages; the serial monitor
+shows firmware results.** `make` finishes after programming and startup, while
+the board can still be running its benchmark. Wait for **`Run completed`** in
+the serial monitor before recording the result or starting another run.
+
+The command's exit status reports preparation, compilation and loading failures.
+Firmware verification and timing errors are reported separately over UART.
+J-Link diagnostics are saved in `bin_board/jlink_flash.log`.
+
+To compile first and load later, use:
+
+```powershell
 make board BACKEND=bitslice
+# Open/start the serial monitor before the next command.
+make flash
 ```
 
-`SDK_ROOT` is optional: the Makefile uses `AMBIQ_SDK_ROOT` when set, otherwise
-`../../AmbiqSuite_R4.5.0`. Only add `SDK_ROOT=<your SDK installation path>` if
-the SDK is installed elsewhere.
+`make flash` loads the existing firmware without rebuilding. Its backend is
+the one selected when that firmware was built. Rebuild after changing the
+model, inputs, source code, backend or repeat count.
 
-Load/debug **`bin_board/general.axf`**, which includes the model and encoded
-inputs. The build also produces `general.bin` (application image without the
-bootloader), `general.map` and `general.size` (memory placement and sizes) in
-`bin_board/`.
+## 7. Read and save the report
 
-Every preparation clears previous host and board binaries: rebuild the board
-firmware after a host run. Switching backend needs no cleanup; **`make clean`
-also empties `model/`, `input/` and `input_test/`**.
+A successful run with ten verification samples and ten measurement samples,
+using the default ten repetitions, has this structure. The ellipses stand for
+values that depend on the model, backend and build:
 
-## Load and run the board
+```text
+Apollo4 BL EVB implementations
+Backend: scalar
+Verifying predictions...
+Verification mismatches: 0 / 10
+Running inference benchmark...
+CPU: 96000000 Hz; runs: 100; cycles min=... mean=... max=...
+Latency: ... ms/inference
 
-**Provisional procedure: these instructions must be updated and validated for
-the final board setup.**
+Flash/MRAM: ... bytes (complete firmware)
+Model blob: ... bytes; encoded samples/predictions: ... bytes
+Code + model + descriptors: ... bytes (excluding samples)
+Static RAM: ... bytes; workspace: ... bytes
+Stack reserved: ...; observed: ...; margin: ... bytes
+SRAM reserved: ... bytes
+SRAM observed peak estimate: ... bytes
+Run completed
+```
 
-1. Connect the J-Link USB-C connector **J6** with a data cable and power the
-   board with **SW4**.
-2. Install SEGGER J-Link and VS Code Cortex-Debug.
-3. Open **`general_version/`** as the VS Code workspace.
-4. In `.vscode/launch.json`, adjust `serverpath`, `armToolchainPath` and `svdFile`
-   to match your installations: the supplied paths reflect one Windows setup
-   and may differ on your PC. Check `device` against your board
-   ([Apollo4 Blue Lite: `AMA4B2KL-KXR`](https://ambiq.com/product/apollo4-blue-lite/)).
-5. In a terminal at `general_version/`, compile with `make board BACKEND=scalar`
-   or `make board BACKEND=bitslice`. Select **General model - Apollo4** and press
-   **F5** to load and run `bin_board/general.axf`. Continue if paused and read
-   the SWO console.
-6. To repeat the measurement, stop with **Shift+F5**, clear the SWO console and
-   press **F5** again; rebuilding is unnecessary if the firmware is unchanged.
+| Report field | Meaning |
+| --- | --- |
+| `Verification mismatches: 0 / 10` | All ten selected predictions match the reference model; this checks agreement on these inputs, rather than dataset accuracy |
+| `CPU` | CPU frequency used to convert cycles to time |
+| `runs` | Measurement sample count multiplied by `REPEATS` |
+| `cycles min / mean / max` | Cycle statistics across timed inferences |
+| `Latency` | Mean inference time on the board, in milliseconds |
+| `Flash/MRAM` | Complete linked application firmware, including model, descriptors and embedded samples; excludes the bootloader |
+| `Model blob` | Size of the supplied `model.bin` |
+| `encoded samples/predictions` | Embedded measurement/test inputs and reference class indices |
+| `Code + model + descriptors` | Firmware size after subtracting embedded samples and reference predictions |
+| `Static RAM` | Static RAM allocations retained by the linker, including inference buffers when used |
+| `workspace` | Required inference working-buffer size; its allocation is included in static RAM when used |
+| `Stack reserved / observed / margin` | Allocated stack, observed use and remaining margin |
+| `SRAM reserved` | Static RAM plus the entire reserved stack |
+| `SRAM observed peak estimate` | Static RAM plus observed stack use; an estimate for this run |
 
-For an optional PC check followed by a bitslice firmware build, run in order:
+Timing follows an untimed warm-up and covers inference on encoded inputs.
+Model initialization, PC input encoding, reference checks and UART reporting
+are outside the timed interval. Stack use is observed before the memory report;
+the SRAM estimate is not a guaranteed worst case for every model/input.
+
+Missing or empty `input_test/inputs.bin`, or fewer than ten complete test
+samples, produces **`0 / 0`**, meaning verification was skipped. With at least
+ten test samples, matching `ref_preds.bin` is required; missing or invalid
+references fail preparation. Incomplete raw samples also fail preparation.
+Missing or empty measurement inputs produce **`Latency: N/A`** and skip the
+benchmark. A firmware with no supplied inputs can initialize and print a
+report, but performs no inference.
+
+With no inference inputs, the linker can remove unused working buffers. The
+`workspace` line still reports the size required to execute this model.
+
+Verification mismatches skip the board benchmark. Invalid timing with supplied
+measurement inputs or an invalid stack report produces
+**`Run completed with errors`**. A model-operation failure prints **`ERROR:`**
+and stops the run. `Run completed` indicates successful completion of the
+checks for which data was available.
+
+Save the report using your serial terminal's logging function or by copying its
+text to a file. Board UART reports are not automatically saved by `make`;
+`jlink_flash.log` contains programming diagnostics.
+
+## 8. Repeat a run or compare backends
+
+To repeat the same firmware, keep the monitor open and press the board's
+**RESET** button. This repeats the embedded tests and benchmark without a
+rebuild or upload. The firmware runs once per reset and then waits for the
+next reset.
+
+To compare scalar and bitslice:
+
+1. Keep the same model, measurement inputs and `REPEATS` value.
+2. Run `make BACKEND=scalar`, wait for completion and save the UART report.
+3. Run `make BACKEND=bitslice`, wait for completion and save that report.
+4. Compare board latency, reference mismatches and memory usage.
+
+Use the same ten test samples if you also want identical verification sets:
+preparation reselects ten indices when more than ten raw test samples are
+available. Measurement inputs always retain their supplied order.
+
+For example, with ten measurement inputs:
 
 ```powershell
-make host BACKEND=bitslice       # Compile and run on the PC
-make board BACKEND=bitslice      # Compile firmware for the board
+make BACKEND=bitslice REPEATS=20
 ```
 
-Check the host's verification results before building the firmware, then load
-it with **F5**. To compare backends, repeat with `BACKEND=scalar`, keeping
-`input/inputs.bin` and `REPEATS` identical, and save each SWO report. PC timings
-do not estimate Apollo4 performance.
+This performs 200 timed inferences. Backend switching needs no cleanup.
 
-**F5 loads existing firmware; it does not compile it.** Rebuild after changing
-the model, inputs, code, backend or `REPEATS`. SWO assumes 96 MHz; adjust
-`cpuFrequency` for a different clock. Do not pause or step during measurements.
+## Command and configuration reference
 
-## Results and measurements
+Run these commands from the project root:
 
-SWO reports verification mismatches, inference cycles/latency and memory usage.
-Timing covers inference after an untimed warm-up, excluding input binarization,
-model initialization, reference comparisons and reporting.
+| Command | Action |
+| --- | --- |
+| `make` / `make run` | Prepare, compile, load and start firmware; scalar by default |
+| `make BACKEND=bitslice` | The complete workflow using bitslice |
+| `make host` | Prepare, compile and run on the PC |
+| `make board` | Prepare and compile firmware without loading it |
+| `make flash` | Load and start the existing `bin_board/general.axf` |
+| `make encode` | Validate the model and supplied inputs/references, then encode inputs without regenerating deployment files or building an application executable |
+| `make prepare` | Encode inputs and generate deployment/model files without building an application executable |
+| `make clean` | Remove supplied local model/input data and generated outputs; recreate `.gitkeep` files |
 
-Debugger values:
+Preparation, including `encode`, keeps supplied model/input files but clears
+both `bin_host/` and `bin_board/`.
+`flash` performs no preparation and preserves the existing build outputs.
 
-- `validation_status`: `0` starting, `1` running, `2` completed, `3` error.
-- `validation_mismatches`: failed reference checks; completion alone does not
-  imply that predictions match.
-- `validation_predictions` and `measurement_predictions`: predicted classes;
-  `measurement_predictions_valid` confirms that measurement predictions exist.
-- `timing.valid`: `1` when timing checks passed. Results are in
-  `timing.mean_cycles`, `mean_ms`, `min_cycles`, `max_cycles` and `runs`.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BACKEND` | `scalar` | Select `scalar` or `bitslice` when preparing/building |
+| `REPEATS` | `10` | Positive integer: timed repetitions per measurement sample; total timed runs must fit `uint32` |
+| `MODEL_DIR` | `model` | Directory containing `model.json` and `model.bin` |
+| `SDK_ROOT` | `AMBIQ_SDK_ROOT`, otherwise `../../AmbiqSuite_R4.5.0` | SDK installation path |
+| `PYTHON` | `python` | Python interpreter |
+| `CC` | `gcc` | PC compiler |
+| `CFLAGS` | `-O2 -std=c11 -Wall -Wextra -Werror -ffp-contract=off` | PC encoder and host compiler flags; board compiler flags are fixed in `tools/run.py` |
+| `ARM_CC` | `arm-none-eabi-gcc` | ARM compiler |
+| `JLINK` | `JLink` | J-Link Commander executable |
+| `DEVICE` | `AMAP42KL-KBR` | SEGGER device name for the supplied board setup |
+| `JLINK_SERIAL` | Empty | Select a J-Link probe; this is not the UART COM port |
 
-`0 / 0` means verification was skipped. Latency is unavailable when measurement
-inputs are absent or timing checks fail. On the board, failed verification skips
-the benchmark.
+Quote paths containing spaces. For example, select an existing model directory:
 
-The MRAM total includes the model, embedded samples and reporting code.
-The SRAM peak estimate combines static RAM with stack usage observed before the
-memory report; it is **an estimate for this run**, not a guaranteed worst case.
-Host results are saved in `bin_host/host_report.txt`; board results are read
-from SWO/debugger.
+```powershell
+make BACKEND=bitslice MODEL_DIR="../mnist/models/mnist_k64_s0_uni_aug_best"
+```
 
-## Generated files and model support
+`MODEL_DIR` selects model files only. Inputs and references still come from
+this project's `input/` and `input_test/` directories. `make clean` does not
+remove a model directory outside this project.
 
-`make clean` **deletes the supplied model and raw inputs** by emptying `model/`,
-`input/` and `input_test/`. It also removes `bin_input/`, `generated/`,
-`bin_host/` and `bin_board/`. Source code, documentation and external model
-directories selected through `MODEL_DIR` are preserved.
+The variant entry points also support host, board, run and flash commands:
 
-Normal preparation keeps the supplied files but clears both previous host and
-board binaries. Use `make host` or `make board` to build the target you want to
-run; `make prepare` generates deployment data only.
+```powershell
+make -C scalar
+make -C bitslice
+```
 
-## Model description and C interface
+They forward to the root Makefile with their backend selected. Model/input paths
+and configuration overrides are interpreted relative to the project root.
 
-`model.json` describes the layers, their execution order and input encoding.
-`model.bin` stores LUT tables, routing indices and encoding thresholds.
-Preparation checks both files and creates `generated/model_specs.h`: a C header
-describing tensor shapes, operations and where layer data is stored in the
-binary file. It is generated automatically; update the model files and rebuild
-to change the network.
+### Files generated by preparation and compilation
 
-For models that explicitly list their operations, `model.json` must contain
-these four fields:
-
-- `total_bytes`: the expected size of `model.bin`, in bytes.
-- `layers`: descriptions of the LUT layers and the locations of their binary data.
-- `encoding`: settings for binarizing the raw inputs.
-- `operations`: the sequence of operations to execute during inference.
-
-Supported operations are convolution (`lut_conv`),
-OR pooling (`or_pool`), flattening (`flatten`), fully connected layers (`lut_fc`)
-and class selection (`groupsum`). Each operation's output shape must match the
-next input shape, with `groupsum` last. JSON without `operations` is resolved
-from its `conv` and `fc` records into the same execution descriptors. This form
-inserts OR pooling after each convolution, flatten before the FC layers and a
-final GroupSum head; pooling defaults to 2x2 and convolution stride to 1 when
-omitted. Use `operations` to declare other supported execution sequences.
-
-To call the engine from your own C code, use `src/model.h`:
-
-1. Call `model_init()` once with the generated model description and binary data.
-2. Call `model_workspace_bytes()` to find how much working memory to provide.
-3. Call `model_forward()` for each binarized sample, passing that workspace and
-   a variable that receives the predicted class. Check for `MODEL_OK` after
-   initialization and each inference.
-
-The C engine does not binarize raw inputs or allocate memory. Inputs must already
-use the encoder's CHW format (channel, height, width), with bits packed least
-significant first and each plane padded to whole bytes. Keep the model data and
-descriptors valid and unchanged; input, workspace and prediction buffers must
-not overlap each other or overwrite them.
+| Directory/file | Purpose |
+| --- | --- |
+| `bin_input/` | Encoded inputs, selected verification references and encoding metadata |
+| `generated/` | Model/deployment headers, data snapshots and assembler embedding source |
+| `bin_host/` | Successful host executable, report and backend metadata |
+| `bin_board/general.axf` | Linked ELF firmware used by J-Link loading |
+| `bin_board/general.bin` | Raw application image including model/data, without the bootloader; retained as an alternative output |
+| `bin_board/general.map` | Linked memory placement |
+| `bin_board/general.size` | Section-size report |
+| `bin_board/build_info.json` | Backend recorded when compiling firmware |
+| `bin_board/jlink_flash.log` | Diagnostics from the latest load attempt |

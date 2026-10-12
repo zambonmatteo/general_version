@@ -1,4 +1,4 @@
-"""Validate model data, encode inputs, run the host or build Apollo4 firmware."""
+"""Validate model data, encode inputs, and build/run host or Apollo4 firmware."""
 
 import argparse
 import ctypes
@@ -300,6 +300,7 @@ def clean_project(project_dir):
             shutil.rmtree(target)
         if name in supplied:
             target.mkdir()
+            (target / ".gitkeep").touch()
     print("Emptied model/, input/ and input_test/; removed generated build outputs.")
 
 
@@ -421,8 +422,8 @@ def build_board(project_dir, sdk_root, compiler, backend):
                 sdk_root / "CMSIS/ARM/Include", sdk_root / "CMSIS/AmbiqMicro/Include",
                 sdk_root / "devices", sdk_root / "mcu/apollo4l", sdk_root / "mcu/apollo4l/hal",
                 sdk_root / "utils", bsp]
-    flags = arch + ["-std=c11", "-O2", "-g3", "-Wall", "-Wextra", "-Wno-unused-parameter",
-                    "-ffp-contract=off", "-ffunction-sections", "-fdata-sections", "-fstack-usage",
+    flags = arch + ["-std=c11", "-O2", "-Wall", "-Wextra", "-Wno-unused-parameter",
+                    "-ffp-contract=off", "-ffunction-sections", "-fdata-sections",
                     "-DPART_apollo4l", "-DAM_PACKAGE_BGA", "-DAM_PART_APOLLO4L", "-Dgcc"]
     flags += [argument for path in includes for argument in ("-I", str(path))]
     sources = [PROJECT_DIR / "board" / name for name in ("main.c", "startup_gcc.c")]
@@ -452,21 +453,63 @@ def build_board(project_dir, sdk_root, compiler, backend):
         sizes = subprocess.run([prefix + "size", "-A", str(target)], check=True, capture_output=True, text=True)
         (staging / "general.size").write_text(sizes.stdout, encoding="utf-8")
         subprocess.run([prefix + "size", str(target)], check=True)
-        # Retain the linked image, binary, map and size reports. Remove object
-        # files and per-function stack-usage reports from the staged output.
+        # Retain the linked image, binary, map and size reports; remove object files.
         for obj in objects:
             obj.unlink()
-        for path in staging.glob("*.su"):
-            path.unlink()
         (staging / "build_info.json").write_text(json.dumps({"backend": backend}, indent=2) + "\n", encoding="utf-8")
         replace_directory(staging, project_dir, "bin_board")
     print(f"Board firmware: {project_dir / 'bin_board/general.axf'}")
 
 
+def resolve_jlink(executable):
+    candidates = [executable]
+    if executable == "JLink":
+        candidates += ["JLink.exe", "JLinkExe"]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError("J-Link Commander not found. Add it to PATH or set JLINK=<executable path>")
+
+
+def program_firmware(firmware, executable, device, probe_serial):
+    """Load ELF segments and start the CPU in a bounded J-Link Commander session."""
+    if not firmware.is_file():
+        raise ValueError(f"Firmware missing: {firmware}; build it with make board first")
+    log_path = firmware.parent / "jlink_flash.log"
+    with tempfile.TemporaryDirectory(prefix="general-flash-") as temporary:
+        # Commander recognizes .elf; the build's .axf uses the same ELF format.
+        image = Path(temporary) / "firmware.elf"
+        shutil.copyfile(firmware, image)
+        script = Path(temporary) / "commands.jlink"
+        script.write_text(f'r\nh\nloadfile "{image.as_posix()}"\nr\ng\nq\n', encoding="utf-8")
+        command = [executable, "-Device", device, "-If", "SWD", "-Speed", "4000",
+                   "-AutoConnect", "1", "-ExitOnError", "1", "-NoGui", "1",
+                   "-CommandFile", str(script)]
+        if probe_serial:
+            command += ["-USB", probe_serial]
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                    errors="replace", timeout=60, check=False)
+        except subprocess.TimeoutExpired as error:
+            output = error.stdout or b""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            log_path.write_text(output, encoding="utf-8")
+            raise RuntimeError(f"J-Link timed out; see {log_path}") from error
+        log_path.write_text(result.stdout, encoding="utf-8")
+        if result.returncode:
+            tail = "\n".join(result.stdout.splitlines()[-8:])
+            raise RuntimeError(f"J-Link failed (exit {result.returncode}); see {log_path}\n{tail}")
+    print(f"Firmware loaded and started; see {log_path}")
+    print("Read UART output in your serial monitor at 115200 baud.")
+
+
 # Parse command-line options and run the requested preparation/build target.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=("host", "board", "prepare", "encode", "clean"), default="host")
+    parser.add_argument("--target", choices=("host", "board", "run", "flash", "prepare", "encode", "clean"), default="run")
     parser.add_argument("--backend", choices=("scalar", "bitslice"), default="scalar", help="Inference kernels; model files are identical")
     parser.add_argument("--project-dir", type=Path, default=PROJECT_DIR, help="Directory containing model/ and input/")
     parser.add_argument("--model-dir", type=Path, help="Defaults to model/ in the project directory")
@@ -475,6 +518,9 @@ def main():
     parser.add_argument("--arm-cc", default="arm-none-eabi-gcc")
     parser.add_argument("--sdk-root", type=Path, default=Path(os.environ.get("AMBIQ_SDK_ROOT", PROJECT_DIR.parent.parent / "AmbiqSuite_R4.5.0")))
     parser.add_argument("--repeats", type=int, default=10, help="Inference repetitions per measurement sample")
+    parser.add_argument("--jlink", default="JLink", help="J-Link Commander executable")
+    parser.add_argument("--device", default="AMAP42KL-KBR", help="SEGGER target device name")
+    parser.add_argument("--jlink-serial", default="", help="Select a probe when multiple J-Links are connected")
     arguments = parser.parse_args()
     if sys.byteorder != "little":
         raise ValueError("host must be little endian")
@@ -483,6 +529,13 @@ def main():
         raise ValueError("project directory must exist and repeats must be a positive uint32")
     if arguments.target == "clean":
         clean_project(project_dir)
+        return
+    # Check the programming tool before invalidating build artifacts.
+    if arguments.target in ("run", "flash"):
+        jlink = resolve_jlink(arguments.jlink)
+    if arguments.target == "flash":
+        output = checked_directory(project_dir, "bin_board")
+        program_firmware(output / "general.axf", jlink, arguments.device, arguments.jlink_serial)
         return
     # Invalidate both build directories before preparing replacement data so
     # failed preparation cannot leave an executable for a different model.
@@ -505,8 +558,10 @@ def main():
     prepare_deployment(project_dir, manifest, blob, header, operations, arguments.repeats, arguments.backend)
     if arguments.target == "host":
         build_host(project_dir, arguments.cc, arguments.cflags, arguments.backend)
-    elif arguments.target == "board":
+    elif arguments.target in ("board", "run"):
         build_board(project_dir, arguments.sdk_root, arguments.arm_cc, arguments.backend)
+        if arguments.target == "run":
+            program_firmware(project_dir / "bin_board/general.axf", jlink, arguments.device, arguments.jlink_serial)
 
 
 # Run an action and report supported failures with a nonzero exit status.
@@ -514,6 +569,9 @@ def execute_safely(action, *arguments):
     """Use the same concise error handling in the main and child processes."""
     try:
         action(*arguments)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(130)
     except (ValueError, OSError, KeyError, TypeError, OverflowError,
             RuntimeError, subprocess.CalledProcessError) as error:
         print(f"Error: {error}", file=sys.stderr)
