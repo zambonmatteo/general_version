@@ -1,7 +1,7 @@
 # General DWNN implementation
 
 A reusable C inference engine with **scalar and bitslice backends** for exported
-MNIST, CIFAR-10 and KWS LUT models, with a PC preparation pipeline and firmware
+MNIST, CIFAR and KWS LUT models, with a PC preparation pipeline and firmware
 for the **Ambiq Apollo4 Blue Lite EVB**.
 
 The normal workflow is:
@@ -30,7 +30,11 @@ runs autonomously after loading, without a VS Code debugger session.
 | A serial monitor | Display UART output from the board |
 
 Add Python, Make, compiler and J-Link executable directories to `PATH`.
-**GCC is also required for board builds**, because input encoding runs on the PC.
+**GCC is also required for board builds with raw input samples**, because
+input encoding runs on the PC.
+On Windows, use a GCC build targeting the same architecture as Python
+(for example, 64-bit MinGW-w64 with 64-bit Python), so Python can load the
+encoder DLL.
 Python uses only its standard library; no virtual environment or third-party
 Python packages are required.
 
@@ -107,15 +111,20 @@ if their shape, type and preprocessing match the new model's input requirements.
 `model.json` is the only configuration file. Sample counts are inferred from
 binary file sizes. Preparation generates `generated/model_specs.h` automatically;
 you do not need to copy `model_meta.h` or write a C descriptor by hand.
+Do not place `config.json` in `input/` or `input_test/`; preparation rejects it.
 
 ### Raw input format
 
 Each `inputs.bin` contains consecutive, headerless samples in **CHW order**
-(channel, height, width). Shape and input type come from `model.json`:
+(channel, height, width). Raw shape comes from `encoding.in_ch` and
+`encoding.in_hw` in `model.json`; raw type comes from `encoding.input_dtype`:
 
 - `uint8`: one byte per value; the PC encoder divides values by 255.
 - Little-endian `float32`: four bytes per value; values must already have the
   preprocessing and scale expected by the reference model.
+
+Models with an explicit `operations` list must declare `encoding.input_dtype`.
+For exports without `operations`, an omitted input type defaults to `uint8`.
 
 Both backends use the same raw input format. The PC encodes these inputs before
 embedding them in the firmware.
@@ -132,6 +141,8 @@ Preparation randomly selects ten distinct verification source indices and keeps
 inputs and predictions aligned. With exactly ten supplied samples, all ten are
 checked, possibly in a different order. All samples supplied in `input/` are
 used for timing, in file order.
+All encoded measurement samples are embedded in firmware, so select a subset
+that fits in board memory together with the model.
 
 ## 4. Optionally verify on the PC
 
@@ -154,11 +165,13 @@ A mismatch makes the host command fail. You can check bitslice similarly:
 make host BACKEND=bitslice
 ```
 
-Host results are saved in `bin_host/host_report.txt`. PC timing uses `clock()`
+Host results are saved in `bin_host/host_report.txt` only when the command
+succeeds; on failure, read the terminal output. PC timing uses `clock()`
 and describes the PC's performance; use the board's UART report to measure
 Apollo4 latency.
 
-Every preparation clears both previous host and board build directories.
+Every preparation, including `make encode`, clears both previous host and
+board build directories.
 Save a host report elsewhere if you need it after the next build, and rebuild
 board firmware after running `make host`.
 
@@ -202,18 +215,7 @@ The firmware processes embedded inputs automatically, so there is no command
 or sample to type into the monitor. Line-ending selection concerns transmitted
 text and does not control how the firmware's output is received.
 
-### Other serial readers
-
-The extension is optional. You can use
-**[PuTTY in serial mode](https://the.earth.li/~sgtatham/putty/latest/htmldoc/Chapter3.html#using-serial)**
-or any other serial terminal that supports the settings above. In PuTTY, choose
-**Serial**, select the board's serial line and speed **115200**, and configure
-**8 data bits, no parity, 1 stop bit and no flow control**.
-
-Use one reader for the selected serial port at a time. The serial monitor can
-stay open while J-Link programs the board: loading and UART reception use
-separate interfaces. Neither reader requires a `.vscode` directory or a
-Python serial-reading script.
+The VS Code Serial Monitor extension was used for this project, but you can use any serial terminal you prefer with the settings above.
 
 ## 6. Compile, load and start the firmware
 
@@ -291,7 +293,7 @@ Run completed
 | `runs` | Measurement sample count multiplied by `REPEATS` |
 | `cycles min / mean / max` | Cycle statistics across timed inferences |
 | `Latency` | Mean inference time on the board, in milliseconds |
-| `Flash/MRAM` | Complete linked firmware, including model, descriptors and embedded samples |
+| `Flash/MRAM` | Complete linked application firmware, including model, descriptors and embedded samples; excludes the bootloader |
 | `Model blob` | Size of the supplied `model.bin` |
 | `encoded samples/predictions` | Embedded measurement/test inputs and reference class indices |
 | `Code + model + descriptors` | Firmware size after subtracting embedded samples and reference predictions |
@@ -306,10 +308,13 @@ Model initialization, PC input encoding, reference checks and UART reporting
 are outside the timed interval. Stack use is observed before the memory report;
 the SRAM estimate is not a guaranteed worst case for every model/input.
 
-Missing, empty or fewer than ten verification samples produce **`0 / 0`**,
-meaning verification was skipped. Missing measurement inputs produce
-**`Latency: N/A`** and skip the benchmark. A firmware with no supplied inputs
-can initialize and print a report, but performs no inference.
+Missing or empty `input_test/inputs.bin`, or fewer than ten complete test
+samples, produces **`0 / 0`**, meaning verification was skipped. With at least
+ten test samples, matching `ref_preds.bin` is required; missing or invalid
+references fail preparation. Incomplete raw samples also fail preparation.
+Missing or empty measurement inputs produce **`Latency: N/A`** and skip the
+benchmark. A firmware with no supplied inputs can initialize and print a
+report, but performs no inference.
 
 With no inference inputs, the linker can remove unused working buffers. The
 `workspace` line still reports the size required to execute this model.
@@ -350,65 +355,6 @@ make BACKEND=bitslice REPEATS=20
 
 This performs 200 timed inferences. Backend switching needs no cleanup.
 
-## Complete example: MNIST k64 from `make clean`
-
-This example uses ten MNIST images for both verification and measurement.
-It assumes these sibling directories are available; adapt the source paths
-when using your own exported model and dataset:
-
-```text
-mcu_implementation/
-  general_version/
-  mnist/
-    models/mnist_k64_s0_uni_aug_best/
-      model.json
-      model.bin
-      ref_preds.bin
-    data/test_images.bin
-```
-
-Run the following in PowerShell from `general_version/`:
-
-```powershell
-make clean
-
-$mnistModelSource = "..\mnist\models\mnist_k64_s0_uni_aug_best"
-Copy-Item "$mnistModelSource\model.json" .\model\model.json
-Copy-Item "$mnistModelSource\model.bin" .\model\model.bin
-
-$mnistImagePath = (Resolve-Path ..\mnist\data\test_images.bin).Path
-$mnistImages = [IO.File]::ReadAllBytes($mnistImagePath)
-[IO.File]::WriteAllBytes("$PWD\input\inputs.bin", [byte[]]($mnistImages[0..7839]))
-Copy-Item .\input\inputs.bin .\input_test\inputs.bin
-
-$mnistPredictionPath = (Resolve-Path "$mnistModelSource\ref_preds.bin").Path
-$mnistPredictions = [IO.File]::ReadAllBytes($mnistPredictionPath)
-[IO.File]::WriteAllBytes("$PWD\input_test\ref_preds.bin", [byte[]]($mnistPredictions[0..9]))
-
-make host BACKEND=scalar
-```
-
-Each MNIST image has 784 `uint8` values, so 7840 bytes contain the first ten
-images. The first ten reference predictions belong to those same images.
-The full dataset is read on the PC; only the selected ten raw images are
-copied into the project's input files for this example.
-
-After confirming `Verification mismatches: 0 / 10` on the PC, open/start the
-serial monitor as described in step 5. Run each board command separately,
-waiting for `Run completed` and saving its output before continuing:
-
-```powershell
-make BACKEND=scalar REPEATS=10
-```
-
-```powershell
-make BACKEND=bitslice REPEATS=10
-```
-
-To try another MNIST model with compatible raw input requirements, replace
-both model files and copy its matching reference predictions. The ten raw
-images can then be reused.
-
 ## Command and configuration reference
 
 Run these commands from the project root:
@@ -420,21 +366,23 @@ Run these commands from the project root:
 | `make host` | Prepare, compile and run on the PC |
 | `make board` | Prepare and compile firmware without loading it |
 | `make flash` | Load and start the existing `bin_board/general.axf` |
-| `make encode` | Encode the supplied raw inputs only |
+| `make encode` | Validate the model and supplied inputs/references, then encode inputs without regenerating deployment files or building an application executable |
 | `make prepare` | Encode inputs and generate deployment/model files without building an application executable |
 | `make clean` | Remove supplied local model/input data and generated outputs; recreate `.gitkeep` files |
 
-Preparation keeps supplied model/input files but clears both build directories.
+Preparation, including `encode`, keeps supplied model/input files but clears
+both `bin_host/` and `bin_board/`.
 `flash` performs no preparation and preserves the existing build outputs.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BACKEND` | `scalar` | Select `scalar` or `bitslice` when preparing/building |
-| `REPEATS` | `10` | Timed repetitions per measurement sample |
+| `REPEATS` | `10` | Positive integer: timed repetitions per measurement sample; total timed runs must fit `uint32` |
 | `MODEL_DIR` | `model` | Directory containing `model.json` and `model.bin` |
 | `SDK_ROOT` | `AMBIQ_SDK_ROOT`, otherwise `../../AmbiqSuite_R4.5.0` | SDK installation path |
 | `PYTHON` | `python` | Python interpreter |
 | `CC` | `gcc` | PC compiler |
+| `CFLAGS` | `-O2 -std=c11 -Wall -Wextra -Werror -ffp-contract=off` | PC encoder and host compiler flags; board compiler flags are fixed in `tools/run.py` |
 | `ARM_CC` | `arm-none-eabi-gcc` | ARM compiler |
 | `JLINK` | `JLink` | J-Link Commander executable |
 | `DEVICE` | `AMAP42KL-KBR` | SEGGER device name for the supplied board setup |
@@ -473,61 +421,3 @@ and configuration overrides are interpreted relative to the project root.
 | `bin_board/general.size` | Section-size report |
 | `bin_board/build_info.json` | Backend recorded when compiling firmware |
 | `bin_board/jlink_flash.log` | Diagnostics from the latest load attempt |
-
-## Troubleshooting
-
-| Symptom | What to check |
-| --- | --- |
-| Missing `model.json` or `model.bin` | Copy both files after `make clean`, or set `MODEL_DIR` |
-| `incomplete sample` | Check raw input type/shape and that files contain whole samples |
-| Reference count or class-range error | Use this model's predictions, one per raw test sample, with the configured prediction type |
-| `Verification mismatches` greater than zero | Check model/reference pairing, input ordering and preprocessing |
-| `0 / 0` checks | Supply at least ten raw verification samples and matching predictions |
-| `Latency: N/A` | Supply measurement inputs; with inputs present, inspect timing/verification errors |
-| Missing SDK HAL/BSP libraries | Build the libraries or correct `SDK_ROOT` |
-| J-Link executable not found | Add Commander to `PATH` or set `JLINK` to its executable path |
-| Firmware missing for `make flash` | Run `make board` first; previous preparation may have cleared `bin_board/` |
-| Serial port cannot be opened | Check the selected port and close another reader using it |
-| No UART output after a successful load | Check power, port, monitoring and serial settings; start monitoring, then press RESET |
-| Unreadable UART text | Check 115200 baud, 8 data bits, no parity, 1 stop bit and no flow control |
-
-## Source layout and model interface
-
-```text
-general_version/
-  Makefile             Shared preparation/build/loading commands
-  scalar/Makefile       Scalar entry point
-  bitslice/Makefile     Bitslice entry point
-  bitslice/            Word-parallel convolution and OR pooling kernels
-  src/                 Model executor, scalar kernels, encoder and host runner
-  board/               Apollo4 UART benchmark, startup and linker script
-  tools/               JSON preparation, encoding and build/loading orchestration
-  model/               Supplied model files
-  input/               Raw measurement samples
-  input_test/          Raw verification samples and reference predictions
-```
-
-Bitslice processes up to 32 spatial positions of one encoded sample at a time
-for supported convolution and OR-pooling layers. Unsupported layers fall back
-to scalar; FC, flatten and GroupSum use the shared scalar operations. Both
-backends use the same model format and two activation buffers.
-
-For explicit execution graphs, `model.json` provides `total_bytes`, `layers`,
-`encoding` and `operations`. Supported operations are `lut_conv`, `lut_fc`,
-`or_pool`, `flatten` and `groupsum`. Consecutive shapes must agree and GroupSum
-must be last. JSON without `operations` is resolved from its `conv` and `fc`
-records, inserting OR pooling after convolutions, flatten before FC layers
-and the GroupSum head. Pooling defaults to 2x2 and convolution stride to 1 when
-omitted; declare `operations` for another supported execution sequence.
-
-To call the C engine from another application, use `src/model.h`:
-
-1. Initialize the model with `model_init()` and check for `MODEL_OK`.
-2. Obtain the required workspace size using `model_workspace_bytes()`.
-3. Call `model_forward()` with an encoded input, caller-owned workspace and
-   predicted-class destination; check the returned status.
-
-The engine performs no allocation or raw input encoding. Encoded inputs use
-CHW planes, least-significant bit first, with each plane padded to whole bytes.
-Model descriptors and blob must remain valid and immutable. Input, workspace
-and prediction storage must not overlap each other or overwrite model data.
