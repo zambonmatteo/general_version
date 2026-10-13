@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 from prepare_model import model_encoding, prepare_operations, render_header, packed_bytes
+from compact_model import compact_model
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -321,7 +322,7 @@ def assembler_path(path):
 
 
 # Prepare model/input snapshots, C headers and assembler embedding directives.
-def prepare_deployment(project_dir, manifest, blob, header, operations, repeats, backend):
+def prepare_deployment(project_dir, manifest, blob, header, operations, repeats, backend, layout):
     """Embed the model blob, encoded samples and expected class indices."""
     output = project_dir / "generated"
     measure_dir = project_dir / "bin_input/input"
@@ -374,7 +375,8 @@ def prepare_deployment(project_dir, manifest, blob, header, operations, repeats,
                              f".if (. - {symbol}) != {len(data)}", '.error "Deployment file size mismatch"', ".endif"])
         assembly.extend(["#ifndef _WIN32", '.section .note.GNU-stack,""', "#endif"])
         (staging / "deploy_data.S").write_text("\n".join(assembly) + "\n", encoding="utf-8")
-        (staging / "model.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        (staging / "source_model.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        (staging / "model_layout.json").write_text(json.dumps(layout, indent=2) + "\n", encoding="utf-8")
         replace_directory(staging, project_dir, "generated")
     print(f"Prepared {backend} deployment: {len(operations)} operations, {measure_count} measurement inputs, {test_count} checks")
 
@@ -546,7 +548,6 @@ def main():
     blob = (model_dir / "model.bin").read_bytes()
     input_shape, specs, operations = prepare_operations(manifest, blob)
     config = model_encoding(manifest, blob)
-    header = render_header(input_shape, specs, len(blob), operations)
     prediction_dtype = reference_prediction_dtype(manifest)
     jobs = collect_input_jobs(project_dir, config, operations[-1]["classes"], prediction_dtype)
     if jobs:
@@ -555,7 +556,12 @@ def main():
         replace_previous_output(None, project_dir)
     if arguments.target == "encode":
         return
-    prepare_deployment(project_dir, manifest, blob, header, operations, arguments.repeats, arguments.backend)
+    source_bytes = len(blob)
+    blob, specs, layout = compact_model(manifest, blob, specs, arguments.cc, arguments.cflags)
+    header = render_header(input_shape, specs, len(blob), operations)
+    print(f"Model compaction: {source_bytes} -> {len(blob)} bytes ({layout['saved_bytes']} bytes saved)")
+    prepare_deployment(project_dir, manifest, blob, header, operations,
+                       arguments.repeats, arguments.backend, layout)
     if arguments.target == "host":
         build_host(project_dir, arguments.cc, arguments.cflags, arguments.backend)
     elif arguments.target in ("board", "run"):

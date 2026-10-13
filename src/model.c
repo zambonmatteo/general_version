@@ -16,6 +16,31 @@ static int section_fits(BlobSection section, size_t blob_bytes)
            section.bytes <= blob_bytes - section.offset;
 }
 
+static int sections_overlap(BlobSection a, BlobSection b)
+{
+    return a.bytes && b.bytes &&
+           (uint64_t)a.offset < (uint64_t)b.offset + b.bytes &&
+           (uint64_t)b.offset < (uint64_t)a.offset + a.bytes;
+}
+
+static uint32_t read_unsigned(const uint8_t *entry, uint32_t bytes)
+{
+    uint32_t value = 0;
+    for (uint32_t b = 0; b < bytes; ++b)
+        value |= (uint32_t)entry[b] << (8u * b);
+    return value;
+}
+
+static LutLayer layer_view(const LutLayerSpec *spec, const uint8_t *blob)
+{
+    return (LutLayer){
+        .spec = spec,
+        .tables = blob + spec->tables.offset,
+        .indices = blob + spec->indices.offset,
+        .table_ids = spec->table_id_bytes ? blob + spec->table_ids.offset : NULL
+    };
+}
+
 static int shape_valid(TensorShape shape)
 {
     /* Restrict flattened bit counts to uint32_t, without overflowing products. */
@@ -27,10 +52,7 @@ static int shape_valid(TensorShape shape)
 uint32_t lut_index(const Lut *lut, uint32_t j)
 {
     const uint8_t *entry = lut->indices + (size_t)j * lut->index_bytes;
-    uint32_t value = 0;
-    for (uint32_t b = 0; b < lut->index_bytes; ++b)
-        value |= (uint32_t)entry[b] << (8u * b);
-    return value;
+    return read_unsigned(entry, lut->index_bytes);
 }
 
 ModelStatus lut_layer_get(const LutLayer *layer, uint32_t k, Lut *lut)
@@ -41,11 +63,17 @@ ModelStatus lut_layer_get(const LutLayer *layer, uint32_t k, Lut *lut)
         return MODEL_INVALID_ARGUMENT;
     const LutLayerSpec *spec = layer->spec;
     if (k >= spec->n_luts) return MODEL_INVALID_ARGUMENT;
+    uint32_t table = spec->n_tables == 1u ? 0u : k;
+    if (spec->table_id_bytes) {
+        if (!layer->table_ids) return MODEL_INVALID_ARGUMENT;
+        table = read_unsigned(layer->table_ids + (size_t)k * spec->table_id_bytes,
+                              spec->table_id_bytes);
+    }
 
     *lut = (Lut){
         .n_inputs = spec->n_inputs,
         .index_bytes = spec->index_bytes,
-        .table = layer->tables + (size_t)k * table_bytes(spec->n_inputs),
+        .table = layer->tables + (size_t)table * table_bytes(spec->n_inputs),
         .indices = layer->indices + (size_t)k * spec->n_inputs * spec->index_bytes
     };
     return MODEL_OK;
@@ -142,7 +170,7 @@ ModelStatus model_forward(const Model *model, const uint8_t *input, size_t input
         switch (op->type) {
         case OP_LUT: {
             const LutLayerSpec *s = op->parameters.lut;
-            const LutLayer layer = {s, model->blob + s->tables.offset, model->blob + s->indices.offset};
+            const LutLayer layer = layer_view(s, model->blob);
             status = lut_layer_forward(&layer, src, src_bytes, dst, capacity);
             break;
         }
@@ -175,15 +203,30 @@ ModelStatus lut_layer_bind(LutLayer *layer, const LutLayerSpec *spec,
         !shape_valid(spec->input_shape) || !shape_valid(spec->output_shape))
         return MODEL_INVALID_SPEC;
 
-    const uint64_t wanted_tables = (uint64_t)spec->n_luts * table_bytes(spec->n_inputs);
+    if (!spec->n_tables || spec->n_tables > spec->n_luts)
+        return MODEL_INVALID_SPEC;
+    if (!spec->table_id_bytes) {
+        if ((spec->n_tables != 1u && spec->n_tables != spec->n_luts) ||
+            spec->table_ids.offset || spec->table_ids.bytes)
+            return MODEL_INVALID_SPEC;
+    } else {
+        if ((spec->table_id_bytes != 1u && spec->table_id_bytes != 2u && spec->table_id_bytes != 4u) ||
+            spec->n_tables == 1u || spec->n_tables == spec->n_luts ||
+            spec->n_tables > (UINT64_C(1) << (8u * spec->table_id_bytes)) ||
+            spec->table_ids.bytes != (uint64_t)spec->n_luts * spec->table_id_bytes)
+            return MODEL_INVALID_SPEC;
+    }
+
+    const uint64_t wanted_tables = (uint64_t)spec->n_tables * table_bytes(spec->n_inputs);
     const uint64_t wanted_indices = (uint64_t)spec->n_luts * spec->n_inputs * spec->index_bytes;
     if (spec->tables.bytes != wanted_tables || spec->indices.bytes != wanted_indices)
         return MODEL_INVALID_SPEC;
-    if (!section_fits(spec->tables, blob_bytes) || !section_fits(spec->indices, blob_bytes))
+    if (!section_fits(spec->tables, blob_bytes) || !section_fits(spec->indices, blob_bytes) ||
+        !section_fits(spec->table_ids, blob_bytes))
         return MODEL_INVALID_BLOB;
-    /* Tables and mapper entries must describe separate byte ranges. */
-    if ((uint64_t)spec->tables.offset < (uint64_t)spec->indices.offset + spec->indices.bytes &&
-        (uint64_t)spec->indices.offset < (uint64_t)spec->tables.offset + spec->tables.bytes)
+    if (sections_overlap(spec->tables, spec->indices) ||
+        sections_overlap(spec->tables, spec->table_ids) ||
+        sections_overlap(spec->indices, spec->table_ids))
         return MODEL_INVALID_SPEC;
 
     uint64_t index_limit;
@@ -212,7 +255,13 @@ ModelStatus lut_layer_bind(LutLayer *layer, const LutLayerSpec *spec,
         return MODEL_INVALID_SPEC;
     }
 
-    LutLayer bound = {spec, blob + spec->tables.offset, blob + spec->indices.offset};
+    LutLayer bound = layer_view(spec, blob);
+    /* Check IDs before they are used to construct table pointers. */
+    if (spec->table_id_bytes)
+        for (uint32_t k = 0; k < spec->n_luts; ++k)
+            if (read_unsigned(bound.table_ids + (size_t)k * spec->table_id_bytes,
+                              spec->table_id_bytes) >= spec->n_tables)
+                return MODEL_INVALID_INDEX;
     /* Validate all LUT routing indices before assigning the bound layer. */
     for (uint32_t k = 0; k < spec->n_luts; ++k) {
         Lut lut;

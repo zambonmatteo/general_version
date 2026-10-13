@@ -64,6 +64,7 @@ uint32_t lut_eval_conv(const Lut *lut, const LutLayerSpec *spec,
 static int layer_ready(const LutLayer *layer)
 {
     return layer && layer->spec && layer->tables && layer->indices &&
+           (!layer->spec->table_id_bytes || layer->table_ids) &&
            (layer->spec->type == LUT_FULLY_CONNECTED ||
             layer->spec->type == LUT_CONVOLUTION);
 }

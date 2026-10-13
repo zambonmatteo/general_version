@@ -49,6 +49,11 @@ typedef struct {
     uint32_t index_bytes;
     BlobSection tables;
     BlobSection indices;
+    /* No IDs for one shared table or one table per LUT; otherwise IDs are
+     * unsigned little-endian values selecting rows in the table pool. */
+    uint32_t n_tables;
+    uint32_t table_id_bytes;
+    BlobSection table_ids;
     TensorShape input_shape;
     TensorShape output_shape;
     ConvGeometry convolution;
@@ -60,6 +65,7 @@ typedef struct {
     const LutLayerSpec *spec;
     const uint8_t *tables;
     const uint8_t *indices;
+    const uint8_t *table_ids;
 } LutLayer;
 
 typedef struct {

@@ -135,8 +135,11 @@ def layer_spec(sections, prefixes, layer, input_shape, output_shape,
         "n_luts": n_luts,
         "n_inputs": n_inputs,
         "index_bytes": index_bytes,
+        "n_tables": n_luts,
+        "table_id_bytes": 0,
         "tables": (tables["offset"], tables["bytes"]),
         "indices": (indices["offset"], indices["bytes"]),
+        "table_ids": (0, 0),
         "input_shape": input_shape,
         "output_shape": output_shape,
         "convolution": convolution or (0, 0, 0, 0, 0, 0),
@@ -392,8 +395,10 @@ def render_header(input_shape, specs, blob_bytes, operations):
             f'        .n_luts = {spec["n_luts"]}u,',
             f'        .n_inputs = {spec["n_inputs"]}u,',
             f'        .index_bytes = {spec["index_bytes"]}u,',
+            f'        .n_tables = {spec["n_tables"]}u,',
+            f'        .table_id_bytes = {spec["table_id_bytes"]}u,',
             *(f"        .{field} = {initializer(spec[field])}," for field in
-              ("tables", "indices", "input_shape", "output_shape", "convolution")),
+              ("tables", "indices", "table_ids", "input_shape", "output_shape", "convolution")),
             "    },",
         ])
     if specs:
