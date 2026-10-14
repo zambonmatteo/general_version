@@ -375,24 +375,37 @@ def render_header(input_shape, specs, blob_bytes, operations):
         "#define GENERAL_GENERATED_MODEL_H",
         '#include "model.h"',
         "",
-        f"#define MODEL_BLOB_BYTES {blob_bytes}u",
-        f"#define MODEL_LUT_LAYER_COUNT {len(specs)}u",
-        f"#define MODEL_OPERATION_COUNT {len(operations)}u",
-        f"#define MODEL_INPUT_BYTES {packed_bytes(input_shape)}u",
-        f"#define MODEL_WORKSPACE_BYTES {2 * maximum}u",
-        f'#define MODEL_CLASS_COUNT {operations[-1]["classes"]}u',
+        f"#define MODEL_BLOB_BYTES {blob_bytes}u /* Actual model.bin size in bytes. */",
+        f"#define MODEL_LUT_LAYER_COUNT {len(specs)}u /* Number of LUT layers in the network. */",
+        f"#define MODEL_OPERATION_COUNT {len(operations)}u /* LUT, pooling, flatten and GroupSum operations. */",
+        f"#define MODEL_INPUT_BYTES {packed_bytes(input_shape)}u /* Bytes per already encoded sample. */",
+        f"#define MODEL_WORKSPACE_BYTES {2 * maximum}u /* Two buffers sized for the largest intermediate tensor. */",
+        f'#define MODEL_CLASS_COUNT {operations[-1]["classes"]}u /* Number of classes in the GroupSum head. */',
     ]
     if specs:
         lines.append("static const LutLayerSpec model_lut_specs[MODEL_LUT_LAYER_COUNT] = {")
-    for spec in specs:
+    field_comments = {
+        "type": " /* LUT layer type. */",
+        "n_luts": " /* Number of LUTs in this layer. */",
+        "n_inputs": " /* Input bits used by each LUT. */",
+        "index_bytes": " /* Bytes per routing index. */",
+        "tables": " /* Table offset and size in model.bin, in bytes. */",
+        "indices": " /* Routing index offset and size in model.bin, in bytes. */",
+        "input_shape": " /* Encoded input channels, height and width. */",
+        "output_shape": " /* Output channels, height and width. */",
+        "convolution": " /* Kernel H/W, padding H/W, stride H/W; zeros for FC. */",
+    }
+    for layer_index, spec in enumerate(specs):
         # Export names are not emitted as C identifiers or comments.
+        # Explain one descriptor; following layers use the same fields.
+        comments = field_comments if layer_index == 0 else {}
         lines.extend([
             "    {",
-            f'        .type = {spec["type"]},',
-            f'        .n_luts = {spec["n_luts"]}u,',
-            f'        .n_inputs = {spec["n_inputs"]}u,',
-            f'        .index_bytes = {spec["index_bytes"]}u,',
-            *(f"        .{field} = {initializer(spec[field])}," for field in
+            f'        .type = {spec["type"]},{comments.get("type", "")}',
+            f'        .n_luts = {spec["n_luts"]}u,{comments.get("n_luts", "")}',
+            f'        .n_inputs = {spec["n_inputs"]}u,{comments.get("n_inputs", "")}',
+            f'        .index_bytes = {spec["index_bytes"]}u,{comments.get("index_bytes", "")}',
+            *(f"        .{field} = {initializer(spec[field])},{comments.get(field, '')}" for field in
               ("tables", "indices", "input_shape", "output_shape", "convolution")),
             "    },",
         ])

@@ -36,6 +36,13 @@ static uint32_t cpu_clock_hz(void)
     default: return 0;
     }
 }
+
+/* Report rejected measurements outside the timed inference interval. */
+static void benchmark_error(const char *reason)
+{
+    am_util_stdio_printf("BENCHMARK ERROR: %s; completed runs: %u\n",
+                         reason, (unsigned)timing.runs);
+}
 #endif
 
 static void fail(ModelStatus status)
@@ -58,22 +65,34 @@ static void measure_latency(void)
         measurement_predictions[i] = prediction;
     }
     timing.cpu_hz = cpu_clock_hz();
-    if (!timing.cpu_hz) return;
+    if (!timing.cpu_hz) {
+        benchmark_error("unsupported CPU clock mode");
+        return;
+    }
 
     /* Enable the CPU cycle counter and confirm that it advances. */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    if (DWT->CTRL & DWT_CTRL_NOCYCCNT_Msk) return;
+    if (DWT->CTRL & DWT_CTRL_NOCYCCNT_Msk) {
+        benchmark_error("DWT cycle counter unavailable");
+        return;
+    }
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     __DSB(); __ISB();
     uint32_t before = DWT->CYCCNT;
     for (uint32_t i = 0; i < 32u; ++i) { __NOP(); }
-    if (before == DWT->CYCCNT) return;
+    if (before == DWT->CYCCNT) {
+        benchmark_error("DWT cycle counter did not advance");
+        return;
+    }
 
     /* This firmware owns STIMER (6 MHz) to guard against ambiguous DWT wrap.
      * Each inference must fit within one DWT period and one STIMER period. */
     am_hal_stimer_config(AM_HAL_STIMER_HFRC_6MHZ);
     am_hal_stimer_counter_clear();
-    if (!am_hal_stimer_is_running()) return;
+    if (!am_hal_stimer_is_running()) {
+        benchmark_error("STIMER not running after configuration");
+        return;
+    }
     uint32_t minimum = UINT32_MAX, maximum = 0;
     uint64_t total = 0;
     for (uint32_t repeat = 0; repeat < BENCH_REPEATS; ++repeat) {
@@ -92,8 +111,23 @@ static void measure_latency(void)
             /* STIMER reads are outside DWT timing; two extra ticks guard wrap.
              * Reject ambiguous wraps, zero cycles or observed CPU clock changes. */
             if (((uint64_t)wall_ticks + 2u) * timing.cpu_hz >=
-                (uint64_t)UINT32_MAX * 6000000u || !elapsed || cpu_clock_hz() != timing.cpu_hz)
+                (uint64_t)UINT32_MAX * 6000000u) {
+                benchmark_error("elapsed time may include a DWT counter wrap");
+                am_util_stdio_printf("Elapsed cycles: %u; STIMER ticks: %u; CPU: %u Hz\n",
+                    (unsigned)elapsed, (unsigned)wall_ticks, (unsigned)timing.cpu_hz);
                 return;
+            }
+            if (!elapsed) {
+                benchmark_error("inference measured zero DWT cycles");
+                return;
+            }
+            uint32_t current_hz = cpu_clock_hz();
+            if (current_hz != timing.cpu_hz) {
+                benchmark_error("CPU clock changed during the benchmark");
+                am_util_stdio_printf("CPU start: %u Hz; current: %u Hz\n",
+                    (unsigned)timing.cpu_hz, (unsigned)current_hz);
+                return;
+            }
             if (prediction != measurement_predictions[i]) ++timing.mismatches;
             total += elapsed;
             if (elapsed < minimum) minimum = elapsed;
@@ -105,7 +139,18 @@ static void measure_latency(void)
     /* Final timing requires a stable clock and matching baseline predictions. */
     timing.cpu_hz_end = cpu_clock_hz();
     timing.min_cycles = minimum; timing.max_cycles = maximum;
-    if (timing.cpu_hz_end != timing.cpu_hz || timing.mismatches) return;
+    if (timing.cpu_hz_end != timing.cpu_hz) {
+        benchmark_error("CPU clock changed at the end of the benchmark");
+        am_util_stdio_printf("CPU start: %u Hz; end: %u Hz\n",
+            (unsigned)timing.cpu_hz, (unsigned)timing.cpu_hz_end);
+        return;
+    }
+    if (timing.mismatches) {
+        benchmark_error("timed predictions differ from the warm-up predictions");
+        am_util_stdio_printf("Benchmark prediction mismatches: %u\n",
+                             (unsigned)timing.mismatches);
+        return;
+    }
     timing.mean_cycles = (double)total / timing.runs;
     timing.mean_ms = timing.mean_cycles * 1000.0 / timing.cpu_hz;
     timing.valid = 1;

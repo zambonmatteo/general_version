@@ -350,14 +350,17 @@ def prepare_deployment(project_dir, manifest, blob, header, operations, repeats,
             raise ValueError("encoded samples disagree with model input geometry")
     declarations = ["/* Generated deployment data; all samples are already encoded. */",
                     "#ifndef GENERAL_DEPLOY_DATA_H", "#define GENERAL_DEPLOY_DATA_H", "#include <stdint.h>",
-                    f"#define MEASURE_COUNT {measure_count}u", f"#define TEST_COUNT {test_count}u",
-                    f"#define BENCH_REPEATS {repeats}u", f'#define INFERENCE_BACKEND_NAME "{backend}"',
-                    "extern const uint8_t model_blob[];",
-                    "extern const uint8_t measure_inputs[];", "extern const uint8_t test_inputs[];",
-                    "extern const uint32_t test_expected[];"]
+                    f"#define MEASURE_COUNT {measure_count}u /* Number of encoded samples used for timing. */",
+                    f"#define TEST_COUNT {test_count}u /* Number of selected samples used for verification. */",
+                    f"#define BENCH_REPEATS {repeats}u /* Timed repetitions per measurement sample. */",
+                    f'#define INFERENCE_BACKEND_NAME "{backend}" /* Backend name printed in reports. */',
+                    "extern const uint8_t model_blob[]; /* Model binary embedded by deploy_data.S. */",
+                    "extern const uint8_t measure_inputs[]; /* Packed encoded samples for timing. */",
+                    "extern const uint8_t test_inputs[]; /* Packed encoded samples for verification. */",
+                    "extern const uint32_t test_expected[]; /* Reference classes in the selected test order. */"]
     if test_count:
         indices = ", ".join(f"{index}u" for index in test_meta["selected_indices"])
-        declarations.append(f"static const uint32_t test_source_indices[TEST_COUNT] = {{ {indices} }};")
+        declarations.append(f"static const uint32_t test_source_indices[TEST_COUNT] = {{ {indices} }}; /* Original test indices, in selected input order. */")
     declarations.extend(["#endif", ""])
     assembly = ["/* Generated data embedding for GNU assembler, host and ARM. */",
                 "#ifdef _WIN32", '.section .rdata,"dr"', "#else", '.section .rodata.deploy,"a"', "#endif"]

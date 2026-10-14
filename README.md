@@ -137,12 +137,31 @@ To use little-endian `uint32` class indices, add this top-level field to
 "verification": {"prediction_dtype": "uint32"}
 ```
 
-Preparation randomly selects ten distinct verification source indices and keeps
-inputs and predictions aligned. With exactly ten supplied samples, all ten are
-checked, possibly in a different order. All samples supplied in `input/` are
-used for timing, in file order.
-All encoded measurement samples are embedded in firmware, so select a subset
-that fits in board memory together with the model.
+### Sample selection and benchmark size
+
+You can supply files containing more than 32 samples, provided each sample
+matches the model's raw input format. **32 is only an example dataset size;
+the benchmark has no fixed 32-sample limit.** Counts are inferred from file sizes.
+
+| Input file | Samples used |
+| --- | --- |
+| `input_test/inputs.bin` | Exactly **10 distinct samples selected randomly** when at least 10 are supplied; fewer than 10 skips verification |
+| `input/inputs.bin` | **All supplied samples**, in file order, each timed `REPEATS` times |
+
+Every preparation selects the verification indices again and keeps inputs
+and predictions aligned. With exactly ten supplied test samples, all
+ten are checked, possibly in a different order. `input_test/ref_preds.bin`
+must contain one reference prediction for **every supplied test sample**, in
+the same order, even though only ten are selected for verification.
+
+For example, 1,000 samples in `input_test/` require 1,000 reference predictions
+and produce 10 checks. Separately, 100 samples in `input/` with `REPEATS=10`
+produce **1,000 timed inferences** (`measurement sample count * REPEATS`).
+
+All encoded measurement samples, plus the ten selected verification samples
+and their reference predictions when verification is enabled, are embedded in
+firmware. Select a measurement subset that fits in board memory together with
+the model; a large input file can exceed the available memory.
 
 ## 4. Optionally verify on the PC
 
@@ -321,9 +340,14 @@ With no inference inputs, the linker can remove unused working buffers. The
 
 Verification mismatches skip the board benchmark. Invalid timing with supplied
 measurement inputs or an invalid stack report produces
-**`Run completed with errors`**. A model-operation failure prints **`ERROR:`**
-and stops the run. `Run completed` indicates successful completion of the
-checks for which data was available.
+**`Run completed with errors`**. Rejected benchmark measurements first print
+**`BENCHMARK ERROR:`** with the specific reason and the number of completed
+timed inferences. Reasons include an unavailable or stopped cycle counter,
+STIMER not running, an ambiguous counter wrap, a changed CPU clock or
+predictions differing from the untimed warm-up. Such runs report `Latency: N/A`;
+do not use them for latency comparisons. A model-operation failure prints
+**`ERROR:`** and stops the run. `Run completed` indicates successful completion
+of the checks for which data was available.
 
 Save the report using your serial terminal's logging function or by copying its
 text to a file. Board UART reports are not automatically saved by `make`;
