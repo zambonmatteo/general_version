@@ -320,8 +320,8 @@ def assembler_path(path):
     return value
 
 
-# Prepare model/input snapshots, C headers and assembler embedding directives.
-def prepare_deployment(project_dir, manifest, blob, header, operations, repeats, backend):
+# Prepare model/input snapshots, one C header and assembler embedding directives.
+def prepare_deployment(project_dir, manifest, blob, input_shape, specs, operations, repeats, backend):
     """Embed the model blob, encoded samples and expected class indices."""
     output = project_dir / "generated"
     measure_dir = project_dir / "bin_input/input"
@@ -348,9 +348,7 @@ def prepare_deployment(project_dir, manifest, blob, header, operations, repeats,
     for meta, data in ((measure_meta, measure_data), (test_meta, test_data)):
         if len(data) != meta["count"] * sample_bytes:
             raise ValueError("encoded samples disagree with model input geometry")
-    declarations = ["/* Generated deployment data; all samples are already encoded. */",
-                    "#ifndef GENERAL_DEPLOY_DATA_H", "#define GENERAL_DEPLOY_DATA_H", "#include <stdint.h>",
-                    f"#define MEASURE_COUNT {measure_count}u /* Number of encoded samples used for timing. */",
+    declarations = [f"#define MEASURE_COUNT {measure_count}u /* Number of encoded samples used for timing. */",
                     f"#define TEST_COUNT {test_count}u /* Number of selected samples used for verification. */",
                     f"#define BENCH_REPEATS {repeats}u /* Timed repetitions per measurement sample. */",
                     f'#define INFERENCE_BACKEND_NAME "{backend}" /* Backend name printed in reports. */',
@@ -361,7 +359,7 @@ def prepare_deployment(project_dir, manifest, blob, header, operations, repeats,
     if test_count:
         indices = ", ".join(f"{index}u" for index in test_meta["selected_indices"])
         declarations.append(f"static const uint32_t test_source_indices[TEST_COUNT] = {{ {indices} }}; /* Original test indices, in selected input order. */")
-    declarations.extend(["#endif", ""])
+    header = render_header(input_shape, specs, len(blob), operations, deployment_lines=declarations)
     assembly = ["/* Generated data embedding for GNU assembler, host and ARM. */",
                 "#ifdef _WIN32", '.section .rdata,"dr"', "#else", '.section .rodata.deploy,"a"', "#endif"]
     files = {"model_blob": ("model.bin", blob), "measure_inputs": ("measure.bin", measure_data),
@@ -369,7 +367,6 @@ def prepare_deployment(project_dir, manifest, blob, header, operations, repeats,
     with tempfile.TemporaryDirectory(prefix="model-deployment-") as temporary:
         staging = Path(temporary)
         (staging / "model_specs.h").write_text(header, encoding="utf-8")
-        (staging / "deploy_data.h").write_text("\n".join(declarations), encoding="utf-8")
         for symbol, (name, data) in files.items():
             (staging / name).write_bytes(data)
             assembly.extend([".balign 4", f".global {symbol}", f"{symbol}:",
@@ -549,7 +546,6 @@ def main():
     blob = (model_dir / "model.bin").read_bytes()
     input_shape, specs, operations = prepare_operations(manifest, blob)
     config = model_encoding(manifest, blob)
-    header = render_header(input_shape, specs, len(blob), operations)
     prediction_dtype = reference_prediction_dtype(manifest)
     jobs = collect_input_jobs(project_dir, config, operations[-1]["classes"], prediction_dtype)
     if jobs:
@@ -558,7 +554,8 @@ def main():
         replace_previous_output(None, project_dir)
     if arguments.target == "encode":
         return
-    prepare_deployment(project_dir, manifest, blob, header, operations, arguments.repeats, arguments.backend)
+    prepare_deployment(project_dir, manifest, blob, input_shape, specs, operations,
+                       arguments.repeats, arguments.backend)
     if arguments.target == "host":
         build_host(project_dir, arguments.cc, arguments.cflags, arguments.backend)
     elif arguments.target in ("board", "run"):

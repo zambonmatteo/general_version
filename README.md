@@ -109,8 +109,9 @@ reference predictions from the new model as well. Raw inputs can be reused only
 if their shape, type and preprocessing match the new model's input requirements.
 
 `model.json` is the only configuration file. Sample counts are inferred from
-binary file sizes. Preparation generates `generated/model_specs.h` automatically;
-you do not need to copy `model_meta.h` or write a C descriptor by hand.
+binary file sizes. Preparation generates `generated/model_specs.h` automatically,
+combining network descriptors, embedded-data declarations and benchmark settings.
+You do not need to copy `model_meta.h` or write a C descriptor by hand.
 Do not place `config.json` in `input/` or `input_test/`; preparation rejects it.
 
 ### Raw input format
@@ -437,7 +438,7 @@ and configuration overrides are interpreted relative to the project root.
 | Directory/file | Purpose |
 | --- | --- |
 | `bin_input/` | Encoded inputs, selected verification references and encoding metadata |
-| `generated/` | Model/deployment headers, data snapshots and assembler embedding source |
+| `generated/` | Unified `model_specs.h`, data snapshots and assembler embedding source |
 | `bin_host/` | Successful host executable, report and backend metadata |
 | `bin_board/general.axf` | Linked ELF firmware used by J-Link loading |
 | `bin_board/general.bin` | Raw application image including model/data, without the bootloader; retained as an alternative output |

@@ -1,9 +1,0 @@
-
-1. Summary: Problem, approach, personal contribution, and principal findings.
-2. Introduction: motivation, objectives, research questions, and scope.
-3. Background and related work: LUT networks, binary representation, and scalar and bitslice evaluation.
-4. Baseline models and experimental platform: Supplied models and reference software, board, memories, and toolchain.
-5. Deployment on the microcontroller: Porting, startup and linking, data placement, validation, and measurement.
-6. Design of a general engine: PC preparation, model descriptors, operations, interfaces, and buffer reuse.
-7. Experimental evaluation and discussion: Correctness, latency and memory results, backend tradeoffs, and measurement limits.
-8. Conclusions and future work 

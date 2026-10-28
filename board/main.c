@@ -3,7 +3,6 @@
 #include "am_util.h"
 #include "model.h"
 #include "model_specs.h"
-#include "deploy_data.h"
 
 /* Runtime state/workspace use SRAM; model/descriptors and encoded inputs use
  * MRAM. Input binarization runs on the PC. */
@@ -160,24 +159,24 @@ static void measure_latency(void)
 /* Report linked memory sizes and stack usage observed before this report. */
 static int print_memory(void)
 {
-    uintptr_t bottom = (uintptr_t)&__dwn_stack_start, top = (uintptr_t)&__dwn_stack_end;
+    uintptr_t bottom = (uintptr_t)&__dwn_stack_start, top = (uintptr_t)&__dwn_stack_end; /* Stack bounds. */
     /* Mask interrupts during the stack scan, then restore their prior state. */
     uint32_t irq_state = __get_PRIMASK();
     __disable_irq();
-    uintptr_t sp = __get_MSP(), cursor = bottom;
-    if (sp < bottom || sp > top) {
+    uintptr_t sp = __get_MSP(), cursor = bottom; /* Read SP; start scan. */
+    if (sp < bottom || sp > top) { /* Check stack bounds. */
         __set_PRIMASK(irq_state);
         am_util_stdio_printf("MEMORY ERROR: stack pointer outside reserved region\n");
         return 0;
     }
     /* Scan the startup marker; include unwritten space in the current frame. */
-    while (cursor < top && *(volatile uint32_t *)cursor == 0xA5A5A5A5u) cursor += 4u;
+    while (cursor < top && *(volatile uint32_t *)cursor == 0xA5A5A5A5u) cursor += 4u; /* Scan untouched stack. */
     if (sp < cursor) cursor = sp;
     __set_PRIMASK(irq_state);
-    uint32_t reserved = (uint32_t)(top - bottom), observed = (uint32_t)(top - cursor);
-    uint32_t margin = (uint32_t)(cursor - bottom);
-    uint32_t ram = (uint32_t)(uintptr_t)&__dwn_static_ram_bytes;
-    uint32_t flash = (uint32_t)(uintptr_t)&__dwn_mram_image_bytes;
+    uint32_t reserved = (uint32_t)(top - bottom), observed = (uint32_t)(top - cursor); /* Reserved and observed stack. */
+    uint32_t margin = (uint32_t)(cursor - bottom); /* Remaining stack space. */
+    uint32_t ram = (uint32_t)(uintptr_t)&__dwn_static_ram_bytes; /* Linked static RAM size. */
+    uint32_t flash = (uint32_t)(uintptr_t)&__dwn_mram_image_bytes; /* Linked MRAM image size. */
     uint32_t data = (MEASURE_COUNT + TEST_COUNT) * MODEL_INPUT_BYTES + TEST_COUNT * 4u;
     /* MRAM includes samples; SRAM peak is static RAM + observed stack, an estimate. */
     am_util_stdio_printf("Flash/MRAM: %u bytes (complete firmware)\n", (unsigned)flash);
@@ -187,10 +186,10 @@ static int print_memory(void)
     am_util_stdio_printf("Static RAM: %u bytes; workspace: %u bytes\n", (unsigned)ram, (unsigned)sizeof(workspace));
     am_util_stdio_printf("Stack reserved: %u; observed: %u; margin: %u bytes\n",
                          (unsigned)reserved, (unsigned)observed, (unsigned)margin);
-    am_util_stdio_printf("SRAM reserved: %u bytes\n", (unsigned)(ram + reserved));
-    if (margin) am_util_stdio_printf("SRAM observed peak estimate: %u bytes\n", (unsigned)(ram + observed));
+    am_util_stdio_printf("SRAM reserved: %u bytes\n", (unsigned)(ram + reserved)); /* Static RAM + reserved stack. */
+    if (margin) am_util_stdio_printf("SRAM observed peak estimate: %u bytes\n", (unsigned)(ram + observed)); /* Report peak if valid. */
     else am_util_stdio_printf("SRAM observed peak estimate: INVALID (watermark exhausted)\n");
-    return margin != 0;
+    return margin != 0; /* Require remaining stack space. */
 }
 
 /* Initialize the board/model, verify predictions and report benchmark results. */

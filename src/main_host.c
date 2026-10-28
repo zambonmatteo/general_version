@@ -2,7 +2,6 @@
 #include <time.h>
 #include "model.h"
 #include "model_specs.h"
-#include "deploy_data.h"
 
 static Model model;
 static uint8_t workspace[MODEL_WORKSPACE_BYTES];
