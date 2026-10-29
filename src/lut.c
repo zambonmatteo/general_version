@@ -4,25 +4,42 @@
 #endif
 #include <string.h>
 
-static uint32_t input_bit(const uint8_t *input, uint32_t position)
+static uint32_t packed_bit(const uint8_t *data, uint32_t position)
 {
-    return (uint32_t)((input[position / 8u] >> (position % 8u)) & 1u);
+    return (uint32_t)((data[position / 8u] >> (position % 8u)) & 1u);
+}
+
+/* Routing entries are little-endian uint16/uint32 and may be unaligned. */
+static inline uint32_t read_fc_index(const uint8_t *entry, uint32_t index_bytes)
+{
+    uint32_t value = (uint32_t)entry[0] | ((uint32_t)entry[1] << 8u);
+    if (index_bytes == 4u)
+        value |= ((uint32_t)entry[2] << 16u) | ((uint32_t)entry[3] << 24u);
+    return value;
+}
+
+static inline uint32_t fc_lut_address(const uint8_t *input, const uint8_t *indices,
+                                     uint32_t n_inputs, uint32_t index_bytes)
+{
+    uint32_t address = 0;
+    for (uint32_t j = 0; j < n_inputs; ++j) {
+        const uint32_t position = read_fc_index(indices, index_bytes);
+        /* Routing entry j selects address bit j, least significant first. */
+        address |= packed_bit(input, position) << j;
+        indices += index_bytes;
+    }
+    return address;
 }
 
 uint32_t lut_table_bit(const Lut *lut, uint32_t address)
 {
-    return (uint32_t)((lut->table[address / 8u] >> (address % 8u)) & 1u);
+    return packed_bit(lut->table, address);
 }
 
 uint32_t lut_eval_fc(const Lut *lut, const uint8_t *input)
 {
-    uint32_t address = 0;
-    for (uint32_t j = 0; j < lut->n_inputs; ++j) {
-        const uint32_t position = lut_index(lut, j);
-        /* Preserve mapper order: selected input j becomes address bit j. */
-        address |= input_bit(input, position) << j;
-    }
-    return lut_table_bit(lut, address);
+    return packed_bit(lut->table,
+        fc_lut_address(input, lut->indices, lut->n_inputs, lut->index_bytes));
 }
 
 uint32_t lut_eval_conv(const Lut *lut, const LutLayerSpec *spec,
@@ -56,7 +73,7 @@ uint32_t lut_eval_conv(const Lut *lut, const LutLayerSpec *spec,
         if (y < 0 || x < 0 || y >= height || x >= width) continue;
         const uint8_t *plane = input + (size_t)channel * plane_bytes;
         const uint32_t position = (uint32_t)y * width + (uint32_t)x;
-        address |= input_bit(plane, position) << j;
+        address |= packed_bit(plane, position) << j;
     }
     return lut_table_bit(lut, address);
 }
@@ -95,11 +112,19 @@ static void set_output_bit(uint8_t *output, uint32_t position)
 
 static void forward_fc(const LutLayer *layer, const uint8_t *input, uint8_t *output)
 {
-    for (uint32_t k = 0; k < layer->spec->n_luts; ++k) {
-        Lut lut;
-        /* Binding and this loop's bounds guarantee that the view is valid. */
-        (void)lut_layer_get(layer, k, &lut);
-        if (lut_eval_fc(&lut, input)) set_output_bit(output, k);
+    const LutLayerSpec *spec = layer->spec;
+    const uint32_t n_inputs = spec->n_inputs, index_bytes = spec->index_bytes;
+    /* Binding validates n_inputs in 1..31; each table row is byte-padded. */
+    const size_t table_stride = ((UINT32_C(1) << n_inputs) + 7u) / 8u;
+    const size_t index_stride = (size_t)n_inputs * index_bytes;
+    const uint8_t *table = layer->tables;
+    const uint8_t *indices = layer->indices;
+
+    for (uint32_t k = 0; k < spec->n_luts; ++k) {
+        const uint32_t address = fc_lut_address(input, indices, n_inputs, index_bytes);
+        if (packed_bit(table, address)) set_output_bit(output, k);
+        table += table_stride;
+        indices += index_stride;
     }
 }
 
@@ -158,7 +183,7 @@ static void forward_conv(const LutLayer *layer, const uint8_t *input, uint8_t *o
                         const int32_t ix = origin_x + (int32_t)taps[j].column;
                         /* Unsigned bounds also reject negative coordinates. */
                         if ((uint32_t)iy >= input_height || (uint32_t)ix >= input_width) continue;
-                        address |= input_bit(taps[j].plane, (uint32_t)iy * input_width + (uint32_t)ix) << j;
+                        address |= packed_bit(taps[j].plane, (uint32_t)iy * input_width + (uint32_t)ix) << j;
                     }
                     if (lut_table_bit(&lut, address)) set_output_bit(plane, y * width + x);
                 }
@@ -173,7 +198,7 @@ static void forward_conv(const LutLayer *layer, const uint8_t *input, uint8_t *o
                         const int64_t iy = origin_y + taps[j].row;
                         const int64_t ix = origin_x + taps[j].column;
                         if (iy < 0 || ix < 0 || iy >= input_height || ix >= input_width) continue;
-                        address |= input_bit(taps[j].plane, (uint32_t)iy * input_width + (uint32_t)ix) << j;
+                        address |= packed_bit(taps[j].plane, (uint32_t)iy * input_width + (uint32_t)ix) << j;
                     }
                     if (lut_table_bit(&lut, address)) set_output_bit(plane, y * width + x);
                 }
