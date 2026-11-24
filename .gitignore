@@ -1,5 +1,6 @@
-/bin_input/
-/generated/
-/bin_host/
-/bin_board/
+/build/*
+!/build/.gitkeep
+/data/*
+!/data/.gitkeep
 __pycache__/
+*.pyc
